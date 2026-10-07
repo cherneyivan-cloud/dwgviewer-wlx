@@ -196,9 +196,27 @@ static HFONT text_font(TextFontEnt *c, int h, int esc)
   return e->font;
 }
 
+/* Цвет с учётом фона: на чёрном фоне слишком тёмные цвета делаем светлыми,
+   на белом — слишком светлые делаем тёмными.  Без этого чёрный текст на
+   чёрном фоне не виден (частый случай: текст чёрный, линии белые). */
+static COLORREF adjust_color(COLORREF c, int bg_white)
+{
+  int r = GetRValue(c), g = GetGValue(c), b = GetBValue(c);
+  int lum = (r * 299 + g * 587 + b * 114) / 1000;
+  if (!bg_white) {
+    if (lum < 45)
+      return RGB(255, 255, 255);
+  } else {
+    if (lum > 215)
+      return RGB(0, 0, 0);
+  }
+  return c;
+}
+
 /* starts/ends: indices into text string per line */
 static void draw_text_prim(HDC hdc, KPrim *p, const XForm *xf,
-                           PenEnt *pc, TextFontEnt *fc, int draw_text)
+                           PenEnt *pc, TextFontEnt *fc, int draw_text,
+                           int bg_white)
 {
   (void)pc;
   if (!draw_text || !p->text || !p->text[0])
@@ -225,7 +243,7 @@ static void draw_text_prim(HDC hdc, KPrim *p, const XForm *xf,
   HFONT old = (HFONT)SelectObject(hdc, font);
   int oldta = SetTextAlign(hdc, TA_LEFT | TA_BASELINE | TA_NOUPDATECP);
   SetBkMode(hdc, TRANSPARENT);
-  SetTextColor(hdc, p->color);
+  SetTextColor(hdc, adjust_color(p->color, bg_white));
 
   /* split into lines */
   double px0, py0;
@@ -311,17 +329,18 @@ static void draw_prim(HDC hdc, KPrim *p, const XForm *xf, const DrawOpts *o,
                       TextFontEnt *fc)
 {
   if (p->kind == KP_TEXT) {
-    draw_text_prim(hdc, p, xf, pc, fc, draw_text);
+    draw_text_prim(hdc, p, xf, pc, fc, draw_text, o->bg_white);
     return;
   }
   if (!prim_visible(p, xf, cw, ch))
     return;
+  COLORREF col = adjust_color(p->color, o->bg_white);
   if (p->kind == KP_POINT) {
     double x, y;
     xf_apply(xf, p->p[0].x, p->p[0].y, &x, &y);
     /* small cross marker */
     int s = 3;
-    HPEN pen = get_pen(pc, p->color, DPS_SOLID, o->pen_width);
+    HPEN pen = get_pen(pc, col, DPS_SOLID, o->pen_width);
     HPEN old = (HPEN)SelectObject(hdc, pen);
     MoveToEx(hdc, (int)(x - s), (int)y, NULL);
     LineTo(hdc, (int)(x + s), (int)y);
@@ -334,10 +353,10 @@ static void draw_prim(HDC hdc, KPrim *p, const XForm *xf, const DrawOpts *o,
   int n = prim_to_dev(p, xf, dev, 2048);
   if (n < 2)
     return;
-  HPEN pen = get_pen(pc, p->color, p->pen, o->pen_width);
+  HPEN pen = get_pen(pc, col, p->pen, o->pen_width);
   HPEN oldpen = (HPEN)SelectObject(hdc, pen);
   if (p->fill) {
-    HBRUSH br = get_brush(pc, (DWORD)p->color);
+    HBRUSH br = get_brush(pc, (DWORD)col);
     HBRUSH oldbr = (HBRUSH)SelectObject(hdc, br);
     Polygon(hdc, dev, n);
     SelectObject(hdc, oldbr);

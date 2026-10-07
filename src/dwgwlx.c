@@ -60,6 +60,9 @@ typedef struct {
   int need_fit;
   double fit_scale;
 
+  int flipX;       /* зеркало по горизонтали */
+  int flipY;       /* зеркало по вертикали (если файл нарисован «вверх ногами») */
+
   int dragging;
   int prev_x, prev_y;
 
@@ -72,6 +75,46 @@ static int g_class_registered;
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
+
+static void get_ini_path(wchar_t *out, int cch)
+{
+  if (cch < 8)
+    return;
+  GetModuleFileNameW(g_dll_handle, out, cch);
+  wchar_t *s = wcsrchr(out, L'\\');
+  if (s)
+    *(s + 1) = 0;
+  wcscat(out, L"dwgviewer.ini");
+}
+
+static void save_view_opts(ViewCtx *v)
+{
+  wchar_t ini[MAX_PATH];
+  get_ini_path(ini, MAX_PATH);
+  WritePrivateProfileStringW(L"Options", L"FlipX", v->flipX ? L"1" : L"0",
+                             ini);
+  WritePrivateProfileStringW(L"Options", L"FlipY", v->flipY ? L"1" : L"0",
+                             ini);
+}
+
+/* Зеркалирование вида относительно центра клиентской области. */
+static void apply_view_flips(ViewCtx *v)
+{
+  RECT rc;
+  GetClientRect(v->hWnd, &rc);
+  int cw = rc.right - rc.left;
+  int ch = rc.bottom - rc.top;
+  if (v->flipX) {
+    v->view.a = -v->view.a;
+    v->view.c = -v->view.c;
+    v->view.e = (double)cw - v->view.e;
+  }
+  if (v->flipY) {
+    v->view.b = -v->view.b;
+    v->view.d = -v->view.d;
+    v->view.f = (double)ch - v->view.f;
+  }
+}
 
 static void ctx_fit(ViewCtx *v)
 {
@@ -95,6 +138,7 @@ static void ctx_fit(ViewCtx *v)
     v->view = xf;
     v->fit_scale = fabs(xf.a);
   }
+  apply_view_flips(v);
   v->need_fit = 0;
   InvalidateRect(v->hWnd, NULL, FALSE);
 }
@@ -249,22 +293,27 @@ static void zoom_at(ViewCtx *v, int mx, int my, double factor)
 {
   if (factor <= 0)
     return;
+  double cur = fabs(v->view.a);
+  if (cur <= 0)
+    return;
   double minz = v->fit_scale * 1e-6;
   double maxz = v->fit_scale * 1e6;
-  double newa = v->view.a * factor;
-  if (newa < minz || newa > maxz)
+  double newz = cur * factor;
+  if (newz < minz || newz > maxz)
     return;
-  /* model point under cursor must stay fixed */
+  double k = newz / cur;
+  /* точка модели под курсором остаётся на месте; масштабируем ОБЕ оси,
+     сохраняя их знаки (знак d задаёт вертикальную ориентацию). */
   if (v->view.a != 0.0) {
     double xm = ((double)mx - v->view.e) / v->view.a;
-    v->view.e = (double)mx - newa * xm;
+    v->view.a *= k;
+    v->view.e = (double)mx - v->view.a * xm;
   }
   if (v->view.d != 0.0) {
     double ym = ((double)my - v->view.f) / v->view.d;
-    v->view.f = (double)my - newa * ym;
+    v->view.d *= k;
+    v->view.f = (double)my - v->view.d * ym;
   }
-  v->view.a = newa;
-  v->view.d = newa; /* isotropic */
   InvalidateRect(v->hWnd, NULL, FALSE);
 }
 
@@ -449,6 +498,28 @@ static LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wParam,
       case 'F':
         ctx_fit(v);
         break;
+      case 'V': /* зеркало по вертикали */
+        v->flipY ^= 1;
+        apply_view_flips(v);
+        save_view_opts(v);
+        InvalidateRect(hwnd, NULL, FALSE);
+        update_scrollbars(v);
+        break;
+      case 'H': /* зеркало по горизонтали */
+        v->flipX ^= 1;
+        apply_view_flips(v);
+        save_view_opts(v);
+        InvalidateRect(hwnd, NULL, FALSE);
+        update_scrollbars(v);
+        break;
+      case 'B': /* разворот на 180° */
+        v->flipX ^= 1;
+        v->flipY ^= 1;
+        apply_view_flips(v);
+        save_view_opts(v);
+        InvalidateRect(hwnd, NULL, FALSE);
+        update_scrollbars(v);
+        break;
       }
     }
     return 0;
@@ -532,6 +603,8 @@ static ViewCtx *create_view(const WCHAR *file, HWND parent, int showflags,
   int bg = GetPrivateProfileIntW(L"Options", L"Background", 0, ini);
   if (bg == 1)
     v->bg_white = 1;
+  v->flipX = GetPrivateProfileIntW(L"Options", L"FlipX", 0, ini) == 1;
+  v->flipY = GetPrivateProfileIntW(L"Options", L"FlipY", 0, ini) == 1;
 
   v->hWnd = CreateWindowExW(0, VIEW_CLASS, file,
                             WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL,

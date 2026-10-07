@@ -85,7 +85,12 @@ static int save_dib24(const char *path, const BITMAPINFOHEADER *bi,
   fh.bfOffBits = sizeof(fh) + sizeof(BITMAPINFOHEADER);
   fh.bfSize = fh.bfOffBits + (DWORD)row24 * (DWORD)h;
   fwrite(&fh, 1, sizeof(fh), f);
-  fwrite(bi, 1, sizeof(BITMAPINFOHEADER), f);
+  {
+    BITMAPINFOHEADER h24 = *bi;
+    h24.biBitCount = 24;
+    h24.biSizeImage = (DWORD)row24 * (DWORD)h;
+    fwrite(&h24, 1, sizeof(BITMAPINFOHEADER), f);
+  }
   fwrite(px, 1, (size_t)row24 * (size_t)h, f);
   fclose(f);
   free(px);

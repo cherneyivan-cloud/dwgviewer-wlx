@@ -1,0 +1,9 @@
+# Нормализация переносов строк, чтобы скрипты работали в своих средах.
+*.sh   text eol=lf
+*.c    text eol=lf
+*.h    text eol=lf
+*.def  text eol=lf
+*.ps1  text eol=crlf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.bat  text eol=crlf
