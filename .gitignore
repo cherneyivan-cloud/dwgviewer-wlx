@@ -30,4 +30,6 @@ _*
 .idea/
 *.iml
 .DS_Store
-Thumbs.db
+Thumbs.db*.zip
+*.7z
+*.rar
