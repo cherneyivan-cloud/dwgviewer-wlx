@@ -1,0 +1,20 @@
+LIBRARY dwgviewer
+EXPORTS
+  ListLoadW
+  ListCloseWindowW
+  ListGetDetectStringW
+  ListSearchTextW
+  ListSendCommandW
+  ListPrintW
+  ListNotificationReceivedW
+  ListGetPreviewBitmapW
+  ListSetDefaultParamsW
+  ListLoad
+  ListCloseWindow
+  ListGetDetectString
+  ListSearchText
+  ListSendCommand
+  ListPrint
+  ListNotificationReceived
+  ListGetPreviewBitmap
+  ListSetDefaultParams

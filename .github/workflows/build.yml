@@ -1,0 +1,61 @@
+name: build
+
+# Сборка плагина на GitHub Actions (Windows x64).
+# Запускается:
+#  - по тегу v* (создание Release)
+#  - вручную (workflow_dispatch)
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python (для setup-скрипта)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download toolchain (w64devkit) and LibreDWG 0.14
+        run: powershell -ExecutionPolicy Bypass -File build\setup_toolchain.ps1
+
+      - name: Verify toolchain
+        run: tools\w64devkit\bin\gcc.exe --version
+        shell: cmd
+
+      - name: Package sources (сразу после checkout, пока дерево чистое)
+        run: |
+          mkdir dist
+          tar -a -c -f dist\DwgViewer-src.zip src build devtest .github .gitignore build.bat README.md LICENSE PUBLISH.md
+          dir dist
+        shell: cmd
+
+      - name: Build dwgviewer.wlx
+        run: build.bat
+        shell: cmd
+
+      - name: Package binaries
+        run: |
+          cd dist
+          powershell -Command "tar -a -c -f DwgViewer-win64.zip dwgviewer.wlx libredwg-0.dll README.md LICENSE"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: |
+            dist/DwgViewer-win64.zip
+            dist/DwgViewer-src.zip
+
+      - name: Attach to Release (on tags)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/DwgViewer-win64.zip
+            dist/DwgViewer-src.zip

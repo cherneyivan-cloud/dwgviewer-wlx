@@ -1,0 +1,29 @@
+#include <windows.h>
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_DLL
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904b0"
+    BEGIN
+      VALUE "CompanyName", "DWG Viewer plugin"
+      VALUE "FileDescription", "Lister (WLX) plugin: DWG viewer for Total Commander x64"
+      VALUE "FileVersion", "1.0.0.0"
+      VALUE "InternalName", "dwgviewer"
+      VALUE "OriginalFilename", "dwgviewer.wlx"
+      VALUE "ProductName", "DWG Viewer for Total Commander"
+      VALUE "ProductVersion", "1.0.0.0"
+      VALUE "LegalCopyright", "GPLv3+"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END
