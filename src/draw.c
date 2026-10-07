@@ -212,8 +212,12 @@ static void draw_text_prim(HDC hdc, KPrim *p, const XForm *xf,
   double dirx = ux - ax, diry = uy - ay;
   double upx = vx - ax, upy = vy - ay;
   double hpx = hypot(upx, upy) * p->height;
-  if (hpx < 1.0)
-    return;
+  /* Минимальный читаемый размер шрифта.  На чертежах с большим охватом
+     (например, 10^6..10^7 единиц) реальная высота текста в пикселях при
+     подгонке под окно оказывается < 1 px, и тайтлы пропадают.  Прижимаем
+     снизу, чтобы подписи всегда были читаемы (как у карт/навигаторов). */
+  if (hpx < 8.0)
+    hpx = 8.0;
   if (hpx > 3000)
     hpx = 3000;
   int esc = (int)floor(atan2(diry, dirx) * (180.0 / M_PI) * 10.0 + 0.5);

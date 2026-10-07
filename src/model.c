@@ -164,10 +164,46 @@ static int ent_pen_style(Dwg_Data *dwg, Dwg_Object_Entity *ent)
 
 /* strip MTEXT formatting codes and convert to wide.
    The result is owned by the caller (wchar_t*). */
+/* Проверка, что строка является корректной UTF-8.
+   Многие русские DWG (особенно R2000-R2004 и файлы из русских версий CAD)
+   хранят текст в кодировке Windows-1251.  В этом случае строка НЕ является
+   валидным UTF-8, и мы декодируем её как CP1251. */
+static int is_valid_utf8(const unsigned char *s)
+{
+  if (!s)
+    return 0;
+  size_t len = strlen((const char *)s);
+  size_t i = 0;
+  while (i < len) {
+    unsigned char c = s[i];
+    if (c < 0x80) {
+      i++;
+    } else if ((c & 0xE0) == 0xC0) {
+      if (i + 1 >= len || (s[i + 1] & 0xC0) != 0x80)
+        return 0;
+      i += 2;
+    } else if ((c & 0xF0) == 0xE0) {
+      if (i + 2 >= len || (s[i + 1] & 0xC0) != 0x80 ||
+          (s[i + 2] & 0xC0) != 0x80)
+        return 0;
+      i += 3;
+    } else if ((c & 0xF8) == 0xF0) {
+      if (i + 3 >= len || (s[i + 1] & 0xC0) != 0x80 ||
+          (s[i + 2] & 0xC0) != 0x80 || (s[i + 3] & 0xC0) != 0x80)
+        return 0;
+      i += 4;
+    } else {
+      return 0; /* недопустимый ведущий байт (0x80-0xBF, 0xF8-0xFF) */
+    }
+  }
+  return 1;
+}
+
 static wchar_t *make_text_w(const char *utf8)
 {
   if (!utf8)
     return NULL;
+  int utf8_ok = is_valid_utf8((const unsigned char *)utf8);
   /* first pass: decode %% codes and produce wchar lines */
   wchar_t tmp[4096];
   int n = 0;
@@ -202,23 +238,43 @@ static wchar_t *make_text_w(const char *utf8)
       if (s[2] == '%') { tmp[n++] = L'%'; s += 3; continue; }
       /* unknown %% keep literal */
     }
-    /* plain UTF-8 sequence: decode one char */
-    if (*s < 0x80)      { tmp[n++] = (wchar_t)*s; s++; }
-    else if ((*s & 0xE0) == 0xC0 && s[1]) {
+    /* plain sequence: decode one character */
+    if (*s < 0x80) {
+      tmp[n++] = (wchar_t)*s;
+      s++;
+    } else if (utf8_ok && (*s & 0xE0) == 0xC0 && s[1] &&
+               (s[1] & 0xC0) == 0x80) {
       wchar_t c = (wchar_t)(((*s & 0x1F) << 6) | (s[1] & 0x3F));
-      tmp[n++] = c; s += 2;
-    } else if ((*s & 0xF0) == 0xE0 && s[1] && s[2]) {
+      tmp[n++] = c;
+      s += 2;
+    } else if (utf8_ok && (*s & 0xF0) == 0xE0 && s[1] && s[2] &&
+               (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80) {
       wchar_t c = (wchar_t)(((*s & 0x0F) << 12) | ((s[1] & 0x3F) << 6) |
                             (s[2] & 0x3F));
-      tmp[n++] = c; s += 3;
-    } else if ((*s & 0xF8) == 0xF0 && s[1] && s[2] && s[3]) {
+      tmp[n++] = c;
+      s += 3;
+    } else if (utf8_ok && (*s & 0xF8) == 0xF0 && s[1] && s[2] && s[3] &&
+               (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80 &&
+               (s[3] & 0xC0) == 0x80) {
       wchar_t c = (wchar_t)((((*s & 0x07) << 18) | ((s[1] & 0x3F) << 12) |
                             ((s[2] & 0x3F) << 6) | (s[3] & 0x3F)) - 0x10000);
       if (c < 0xD800 || c >= 0xDC00) /* surrogate pair, keep low surrogate */
         tmp[n++] = c + 0xDC00;
       s += 4;
     } else {
-      tmp[n++] = (wchar_t)*s;
+      /* Windows-1251 (CP1251) fallback for Russian texts:
+         кириллица (А..Я а..я) и Ё/ё */
+      unsigned char b = *s;
+      if (b == 0xA8)
+        tmp[n++] = 0x0401; /* Ё */
+      else if (b == 0xB8)
+        tmp[n++] = 0x0451; /* ё */
+      else if (b >= 0xC0 && b <= 0xDF)
+        tmp[n++] = (wchar_t)(0x0410 + (b - 0xC0)); /* А..Я */
+      else if (b >= 0xE0 && b <= 0xFF)
+        tmp[n++] = (wchar_t)(0x0430 + (b - 0xE0)); /* а..я */
+      else
+        tmp[n++] = (wchar_t)b;
       s++;
     }
   }

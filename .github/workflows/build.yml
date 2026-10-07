@@ -9,6 +9,11 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# GITHUB_TOKEN с 2023 г. по умолчанию имеет только read-права —
+# без contents: write сборка не сможет создать/заполнить Release.
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
