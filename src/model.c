@@ -164,6 +164,73 @@ static int ent_pen_style(Dwg_Data *dwg, Dwg_Object_Entity *ent)
 
 /* strip MTEXT formatting codes and convert to wide.
    The result is owned by the caller (wchar_t*). */
+/* Определение UTF-16LE: LibreDWG для части DWG возвращает text_value как
+   сырые байты UTF-16LE в char*.  Признак: байты на нечётных позициях — это
+   старшие байты кодовой точки (0x00 для Latin, 0x04/0x05 для кириллицы). */
+static int looks_utf16le(const unsigned char *s, int n)
+{
+  if (n < 4)
+    return 0;
+  int pairs = 0, good = 0;
+  for (int i = 0; i + 1 < n; i += 2) {
+    unsigned char hi = s[i + 1];
+    if (hi == 0x00 || hi == 0x04 || hi == 0x05)
+      good++;
+    pairs++;
+  }
+  return pairs > 0 && (good * 100 / pairs) >= 60;
+}
+
+/* Обработка уже «широкой» строки: убираем MTEXT-формат, \P -> перевод строки
+   и коды %%c/%%d/%%p. */
+static wchar_t *finish_text_w(const wchar_t *in)
+{
+  wchar_t tmp[4096];
+  int n = 0, i = 0;
+  while (in[i] && n < 4090) {
+    wchar_t c = in[i];
+    if (c == L'{') {
+      int depth = 1;
+      i++;
+      while (in[i] && depth > 0) {
+        if (in[i] == L'{')
+          depth++;
+        else if (in[i] == L'}')
+          depth--;
+        i++;
+      }
+      continue;
+    }
+    if (c == L'\\' && in[i + 1] == L'P') { tmp[n++] = L'\n'; i += 2; continue; }
+    if (c == L'\\' && in[i + 1] == L'\\') { tmp[n++] = L'\\'; i += 2; continue; }
+    if (c == L'\\' && (in[i + 1] == L'L' || in[i + 1] == L'l' ||
+                       in[i + 1] == L'O' || in[i + 1] == L'o' ||
+                       in[i + 1] == L'K' || in[i + 1] == L'k' ||
+                       in[i + 1] == L'S' || in[i + 1] == L'H' ||
+                       in[i + 1] == L'F' || in[i + 1] == L'A' ||
+                       in[i + 1] == L'C' || in[i + 1] == L'T' ||
+                       in[i + 1] == L'W' || in[i + 1] == L'Z')) {
+      i += 2;
+      continue;
+    }
+    if (c == L'%' && in[i + 1] == L'%' && in[i + 2]) {
+      if (in[i + 2] == L'c') { tmp[n++] = 0x2300; i += 3; continue; }
+      if (in[i + 2] == L'd') { tmp[n++] = 0x00B0; i += 3; continue; }
+      if (in[i + 2] == L'p') { tmp[n++] = 0x00B1; i += 3; continue; }
+      if (in[i + 2] == L'%') { tmp[n++] = L'%'; i += 3; continue; }
+    }
+    tmp[n++] = c;
+    i++;
+  }
+  tmp[n] = 0;
+  if (n == 0)
+    return NULL;
+  wchar_t *out = (wchar_t *)malloc(((size_t)n + 1) * sizeof(wchar_t));
+  if (out)
+    wcscpy(out, tmp);
+  return out;
+}
+
 /* Проверка, что строка является корректной UTF-8.
    Многие русские DWG (особенно R2000-R2004 и файлы из русских версий CAD)
    хранят текст в кодировке Windows-1251.  В этом случае строка НЕ является
@@ -203,6 +270,23 @@ static wchar_t *make_text_w(const char *utf8)
 {
   if (!utf8)
     return NULL;
+  /* LibreDWG возвращает часть текстов как сырые байты UTF-16LE в char*. */
+  {
+    int rawlen = (int)strlen(utf8);
+    if (looks_utf16le((const unsigned char *)utf8, rawlen)) {
+      wchar_t wbuf[4096];
+      int m = 0;
+      for (int i = 0; i + 1 < rawlen && m < 4090; i += 2) {
+        unsigned w = (unsigned)(unsigned char)utf8[i] |
+                     ((unsigned)(unsigned char)utf8[i + 1] << 8);
+        if (w == 0)
+          break;
+        wbuf[m++] = (wchar_t)w;
+      }
+      wbuf[m] = 0;
+      return finish_text_w(wbuf);
+    }
+  }
   int utf8_ok = is_valid_utf8((const unsigned char *)utf8);
   /* first pass: decode %% codes and produce wchar lines */
   wchar_t tmp[4096];
