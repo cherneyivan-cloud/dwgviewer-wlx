@@ -250,31 +250,33 @@ static void draw_text_prim(HDC hdc, KPrim *p, const XForm *xf,
   SetBkMode(hdc, TRANSPARENT);
   SetTextColor(hdc, adjust_color(p->color, bg_white));
 
-  /* split into lines; при заданной ширине рамки — переносим по словам */
+  /* Разбиваем текст на строки (с переносом по ширине рамки), сохраняя ссылки
+     внутрь p->text (перенос не вставляет символов). Затем выводим с учётом
+     точки привязки MTEXT (attachment 1..9). */
   double px0, py0;
   xf_apply(xf, p->pos.x, p->pos.y, &px0, &py0);
-  const wchar_t *s = p->text;
-  int line = 0;
-  double lsp = hpx * 1.33;
   double wscale = hypot(dirx, diry);
   if (wscale < 1e-9)
     wscale = 1.0;
   double maxpx = (p->wrap_width > 0) ? p->wrap_width * wscale : 0.0;
-  wchar_t buf[4096];
 
-  while (s && *s) {
+  const wchar_t *line_p[1024];
+  int line_l[1024];
+  int nlines = 0;
+  wchar_t buf[4096];
+  const wchar_t *s = p->text;
+  while (s && *s && nlines < 1024) {
     const wchar_t *nl = wcschr(s, L'\n');
     int plen = nl ? (int)(nl - s) : (int)wcslen(s);
     if (plen < 0)
       plen = 0;
     if (maxpx <= 1.0) {
-      if (plen > 0)
-        TextOutW(hdc, (int)(px0 + 0.5), (int)(py0 + line * lsp + 0.5), s,
-                 plen);
-      line++;
+      line_p[nlines] = s;
+      line_l[nlines] = plen;
+      nlines++;
     } else {
       int i = 0;
-      while (i < plen) {
+      while (i < plen && nlines < 1024) {
         int count = 0, k = i;
         while (k < plen) {
           int wend = k;
@@ -307,20 +309,57 @@ static void draw_text_prim(HDC hdc, KPrim *p, const XForm *xf,
         int drawLen = count;
         while (drawLen > 0 && s[i + drawLen - 1] == L' ')
           drawLen--;
-        if (drawLen > 0)
-          TextOutW(hdc, (int)(px0 + 0.5), (int)(py0 + line * lsp + 0.5),
-                   s + i, drawLen);
-        line++;
+        line_p[nlines] = s + i;
+        line_l[nlines] = drawLen;
+        nlines++;
         i += count;
         while (i < plen && s[i] == L' ')
           i++;
-        if (line > 256)
-          break;
       }
     }
     s = nl ? nl + 1 : NULL;
-    if (line > 256)
-      break;
+  }
+  if (nlines == 0) {
+    SetTextAlign(hdc, oldta);
+    SelectObject(hdc, old);
+    return;
+  }
+
+  double lsp = hpx * 1.33;
+  int at = p->attach;
+  double base0 = py0; /* TEXT: базовая линия в точке вставки, влево */
+  int ha = 0;
+  if (at >= 1 && at <= 9) {
+    int va = (at - 1) / 3; /* 0 top, 1 middle, 2 bottom */
+    ha = (at - 1) % 3;     /* 0 left, 1 center, 2 right */
+    TEXTMETRICW tm;
+    double asc = hpx, desc = 0;
+    if (GetTextMetricsW(hdc, &tm)) {
+      asc = tm.tmAscent;
+      desc = tm.tmDescent;
+    }
+    double blockH = (double)(nlines - 1) * lsp + asc + desc;
+    if (va == 0)
+      base0 = py0 + asc;                                     /* top */
+    else if (va == 1)
+      base0 = py0 - blockH / 2.0 + asc;                      /* middle */
+    else
+      base0 = py0 - (double)(nlines - 1) * lsp - desc;       /* bottom */
+  }
+
+  for (int li = 0; li < nlines; li++) {
+    double x = px0;
+    if (ha == 1 || ha == 2) {
+      SIZE sz;
+      GetTextExtentPoint32W(hdc, line_p[li], line_l[li], &sz);
+      if (ha == 1)
+        x = px0 - sz.cx / 2.0;
+      else
+        x = px0 - (double)sz.cx;
+    }
+    if (line_l[li] > 0)
+      TextOutW(hdc, (int)(x + 0.5), (int)(base0 + li * lsp + 0.5),
+               line_p[li], line_l[li]);
   }
   SetTextAlign(hdc, oldta);
   SelectObject(hdc, old);
