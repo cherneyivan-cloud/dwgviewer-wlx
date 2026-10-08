@@ -217,8 +217,16 @@ int main(int argc, char **argv)
   wc.lpszClassName = L"HarnessParent";
   RegisterClassExW(&wc);
 
+  int winw = 640, winh = 480;
+  {
+    const char *ew = getenv("HARNESS_W"), *eh = getenv("HARNESS_H");
+    if (ew) winw = atoi(ew);
+    if (eh) winh = atoi(eh);
+    if (winw < 64) winw = 640;
+    if (winh < 64) winh = 480;
+  }
   HWND parent = CreateWindowExW(0, L"HarnessParent", L"harness", WS_OVERLAPPEDWINDOW,
-                                CW_USEDEFAULT, CW_USEDEFAULT, 640, 480, NULL, NULL,
+                                CW_USEDEFAULT, CW_USEDEFAULT, winw, winh, NULL, NULL,
                                 GetModuleHandle(NULL), NULL);
   ShowWindow(parent, SW_SHOW);
   UpdateWindow(parent);
@@ -245,7 +253,7 @@ int main(int argc, char **argv)
   printf("child client: %dx%d\n", cw, ch);
   /* Зум колесом к центру (как делает пользователь), чтобы блоки/текст были
      не в субпиксельном масштабе. */
-  {
+  if (!getenv("HARNESS_NOZOOM")) {
     POINT c;
     c.x = cw / 2;
     c.y = ch / 2;

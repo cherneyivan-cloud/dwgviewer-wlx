@@ -381,7 +381,11 @@ static void draw_prim(HDC hdc, KPrim *p, const XForm *xf, const DrawOpts *o,
       SetBkColor(hdc, o->bg_white ? RGB(255, 255, 255) : RGB(0, 0, 0));
     }
     HBRUSH oldbr = (HBRUSH)SelectObject(hdc, br);
+    /* WINDING вместо ALTERNATE: убирает ложные «дыры» внутри контура при
+       самопересечении петель (частые артефакты штриховок) */
+    int oldmode = SetPolyFillMode(hdc, WINDING);
     Polygon(hdc, dev, n);
+    SetPolyFillMode(hdc, oldmode);
     SelectObject(hdc, oldbr);
     if (del)
       DeleteObject(br);
