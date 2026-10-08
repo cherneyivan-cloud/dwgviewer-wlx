@@ -164,38 +164,35 @@ static int ent_pen_style(Dwg_Data *dwg, Dwg_Object_Entity *ent)
 
 /* strip MTEXT formatting codes and convert to wide.
    The result is owned by the caller (wchar_t*). */
-/* Реальная длина UTF-16LE-строки в байтах: ищем нулевую 16-битную единицу
-   (0000 на чётной позиции).  Обычный strlen() не годится: у ASCII-символов
-   (пробел, дефис и т.п.) старший байт = 0x00, и strlen() обрывает строку на
-   первом таком символе. */
-static int u16_byte_len(const char *s)
+/* Определение UTF-16LE и длины до терминатора.
+   LibreDWG для части DWG возвращает text_value как сырые байты UTF-16LE в
+   char*.  strlen() тут не годится (у ASCII-символов старший байт = 0x00 и
+   обрывает C-строку), поэтому идём по 16-битным единицам:
+     - если встретили 0000 на чётной позиции — это терминатор (конец);
+     - если старший байт единицы не похож на старший байт BMP-символа
+       (0x00 Latin, 0x04/0x05 кириллица и т.п.) — это не UTF-16LE.
+   Возвращает длину в байтах (>=0) либо -1, если строка не UTF-16LE. */
+static int detect_utf16le_len(const unsigned char *s)
 {
-  int i = 0;
-  while (i < 8190) {
-    unsigned char lo = (unsigned char)s[i];
-    unsigned char hi = (unsigned char)s[i + 1];
-    if (lo == 0 && hi == 0)
-      return i; /* терминатор — нулевая кодовая единица */
-    i += 2;
-  }
-  return i;
-}
-
-/* Определение UTF-16LE: LibreDWG для части DWG возвращает text_value как
-   сырые байты UTF-16LE в char*.  Признак: байты на нечётных позициях — это
-   старшие байты кодовой точки (0x00 для Latin, 0x04/0x05 для кириллицы). */
-static int looks_utf16le(const unsigned char *s, int n)
-{
-  if (n < 4)
-    return 0;
-  int pairs = 0, good = 0;
-  for (int i = 0; i + 1 < n; i += 2) {
+  int cs = (int)strlen((const char *)s);
+  int i = 0, pairs = 0;
+  while (i + 1 < 8190) {
+    unsigned char lo = s[i];
     unsigned char hi = s[i + 1];
-    if (hi == 0x00 || hi == 0x04 || hi == 0x05)
-      good++;
+    if (lo == 0 && hi == 0)
+      return (i >= 2) ? i : -1; /* нашли терминатор 0000 */
+    /* допустимые старшие байты: Latin (00), кириллица (04/05),
+       общая пунктуация/символы (20..23) */
+    if (!(hi == 0x00 || hi == 0x04 || hi == 0x05 ||
+          (hi >= 0x20 && hi <= 0x23)))
+      return -1;
+    i += 2;
     pairs++;
+    /* не заходим далеко за конец C-строки (защита от чтения «мимо») */
+    if (i > cs + 64 || pairs > 4096)
+      return -1;
   }
-  return pairs > 0 && (good * 100 / pairs) >= 60;
+  return -1;
 }
 
 /* Обработка уже «широкой» строки: убираем MTEXT-формат, \P -> перевод строки
@@ -289,10 +286,8 @@ static wchar_t *make_text_w(const char *utf8)
     return NULL;
   /* LibreDWG возвращает часть текстов как сырые байты UTF-16LE в char*. */
   {
-    int uslen = (int)strlen(utf8);
-    if (uslen >= 2 &&
-        looks_utf16le((const unsigned char *)utf8, uslen)) {
-      int rawlen = u16_byte_len(utf8); /* настоящая длина (до 0000) */
+    int rawlen = detect_utf16le_len((const unsigned char *)utf8);
+    if (rawlen >= 2) {
       wchar_t wbuf[4096];
       int m = 0;
       for (int i = 0; i + 1 < rawlen && m < 4090; i += 2) {
@@ -987,77 +982,117 @@ static void hatch_path_segs(MBlock *b, Dwg_HATCH_Path *path, COLORREF color,
   }
 }
 
-/* fill a closed polyline hatch loop (solid fill), flattening bulges */
-static void hatch_fill_loop(MBlock *b, Dwg_HATCH_Path *path, COLORREF color)
+/* Построить замкнутый контур петли штриховки (дуги/булджи упрощаются).
+   Возвращает массив точек (free) и их число; при неудаче n=0. */
+static MPt *hatch_loop_pts(Dwg_HATCH_Path *path, int *out_n)
 {
-  Dwg_HATCH_PolylinePath *pl = path->polyline_paths;
-  unsigned long n = path->num_segs_or_paths;
-  if (!pl || n < 3 || (path->flag & 0x20))
-    return;
-  if (n > 4000)
-    n = 4000;
-  int cap = (int)n * 24 + 16;
-  if (cap > (1 << 16))
-    cap = 1 << 16;
-  MPt *pts = (MPt *)malloc((size_t)cap * sizeof(MPt));
-  if (!pts)
-    return;
-  int m = 0;
-  for (unsigned long i = 0; i < n && m < cap; i++) {
-    MPt a, c_;
-    a.x = pl[i].point.x;
-    a.y = pl[i].point.y;
-    c_.x = pl[(i + 1) % n].point.x;
-    c_.y = pl[(i + 1) % n].point.y;
-    double bulge = path->bulges_present ? pl[i].bulge : 0.0;
-    if (bulge == 0.0 || m + 2 >= cap) {
-      pts[m++] = a;
-      continue;
+  *out_n = 0;
+  int cap = 4096;
+  MPt *pt = (MPt *)malloc((size_t)cap * sizeof(MPt));
+  if (!pt)
+    return NULL;
+  int n = 0;
+  if (path->flag & 2) { /* полилиния с булджами */
+    Dwg_HATCH_PolylinePath *pl = path->polyline_paths;
+    unsigned long np = path->num_segs_or_paths;
+    if (!pl || np < 2) {
+      free(pt);
+      return NULL;
     }
-    /* arc between a and c_ */
-    double dx = c_.x - a.x, dy = c_.y - a.y;
-    double chord = sqrt(dx * dx + dy * dy);
-    double theta = 4.0 * atan(bulge);
-    if (theta < 0)
-      theta += 2 * M_PI;
-    double r = (chord / 2.0) /
-               sin(theta >= M_PI ? (2 * M_PI - theta) / 2 : theta / 2);
-    if (r < 0)
-      r = -r;
-    double mx = (a.x + c_.x) / 2.0, my = (a.y + c_.y) / 2.0;
-    double d = sqrt(dx * dx + dy * dy);
-    double h = sqrt(r * r - (d / 2.0) * (d / 2.0));
-    if (!is_fin(h))
-      h = 0;
-    double px = -dy / d, py = dx / d;
-    double dir = (bulge > 0) ? -1.0 : 1.0;
-    double cx = mx + dir * px * h, cy = my + dir * py * h;
-    double a0 = atan2(a.y - cy, a.x - cx);
-    double a1 = atan2(c_.y - cy, c_.x - cx);
-    double span = a1 - a0;
-    if (bulge > 0) {
-      while (span <= 0)
-        span += 2 * M_PI;
-    } else {
-      while (span >= 0)
-        span -= 2 * M_PI;
+    for (unsigned long i = 0; i < np && n < cap; i++) {
+      pt[n].x = pl[i].point.x;
+      pt[n].y = pl[i].point.y;
+      n++;
+      double bg = path->bulges_present ? pl[i].bulge : 0.0;
+      if (bg != 0.0 && n < cap - 2) {
+        MPt a = { pl[i].point.x, pl[i].point.y };
+        MPt c_ = { pl[(i + 1) % np].point.x, pl[(i + 1) % np].point.y };
+        double dx = c_.x - a.x, dy = c_.y - a.y, chord = sqrt(dx * dx + dy * dy);
+        if (chord < 1e-12)
+          continue;
+        double theta = 4.0 * atan(bg);
+        if (theta < 0)
+          theta += 2 * M_PI;
+        double r = (chord / 2.0) /
+                   sin(theta >= M_PI ? (2 * M_PI - theta) / 2 : theta / 2);
+        if (r < 0)
+          r = -r;
+        double mx = (a.x + c_.x) / 2.0, my = (a.y + c_.y) / 2.0;
+        double h = sqrt(r * r - (chord / 2.0) * (chord / 2.0));
+        if (!is_fin(h))
+          h = 0;
+        double dir = (bg > 0) ? -1.0 : 1.0;
+        double cx = mx + dir * (-dy / chord) * h;
+        double cy = my + dir * (dx / chord) * h;
+        double t0 = atan2(a.y - cy, a.x - cx);
+        double t1 = atan2(c_.y - cy, c_.x - cx);
+        double span = t1 - t0;
+        if (bg > 0) {
+          while (span <= 0)
+            span += 2 * M_PI;
+        } else {
+          while (span >= 0)
+            span -= 2 * M_PI;
+        }
+        for (int k = 1; k < 6 && n < cap; k++) {
+          double t = t0 + span * (double)k / 6.0;
+          pt[n].x = cx + r * cos(t);
+          pt[n].y = cy + r * sin(t);
+          n++;
+        }
+      }
     }
-    int steps = (int)(fabs(span) / (M_PI / 24.0)) + 1;
-    if (steps < 2)
-      steps = 2;
-    if (steps > 24)
-      steps = 24;
-    for (int k2 = 0; k2 < steps && m < cap; k2++) {
-      double t = a0 + span * (double)k2 / (double)steps;
-      pts[m].x = cx + r * cos(t);
-      pts[m].y = cy + r * sin(t);
-      m++;
+  } else { /* сегменты: линии/дуги/эллипсы/сплайны */
+    Dwg_HATCH_PathSeg *sg = path->segs;
+    unsigned long ns = path->num_segs_or_paths;
+    if (!sg || ns == 0) {
+      free(pt);
+      return NULL;
     }
-    pts[m++] = c_;
+    for (unsigned long i = 0; i < ns && n < cap; i++) {
+      if (sg[i].curve_type == 1) { /* линия */
+        pt[n].x = sg[i].first_endpoint.x;
+        pt[n].y = sg[i].first_endpoint.y;
+        n++;
+      } else if (sg[i].curve_type == 2) { /* дуга */
+        double a0 = sg[i].start_angle, a1 = sg[i].end_angle;
+        if (!sg[i].is_ccw) { double t = a0; a0 = a1; a1 = t; }
+        double span = a1 - a0;
+        while (span < 0) span += 2 * M_PI;
+        if (span < 1e-9) span += 2 * M_PI;
+        for (int k = 0; k < 8 && n < cap; k++) {
+          double t = a0 + span * (double)k / 8.0;
+          pt[n].x = sg[i].center.x + sg[i].radius * cos(t);
+          pt[n].y = sg[i].center.y + sg[i].radius * sin(t);
+          n++;
+        }
+      } else if (sg[i].curve_type == 3) { /* эллиптическая дуга */
+        double cxx = sg[i].center.x, cyy = sg[i].center.y;
+        double ex = sg[i].endpoint.x - cxx, ey = sg[i].endpoint.y - cyy;
+        double ratio = sg[i].minor_major_ratio > 0 ? sg[i].minor_major_ratio : 1.0;
+        double a0 = sg[i].start_angle, a1 = sg[i].end_angle;
+        double span = a1 - a0;
+        for (int k = 0; k < 10 && n < cap; k++) {
+          double t = a0 + span * (double)k / 10.0, c = cos(t), s = sin(t);
+          pt[n].x = cxx + ex * c - ey * ratio * s;
+          pt[n].y = cyy + ey * c + ex * ratio * s;
+          n++;
+        }
+      } else if (sg[i].curve_type == 4 &&
+                 sg[i].control_points) { /* сплайн — по контрольным точкам */
+        unsigned long m = sg[i].num_control_points;
+        if (m > 64)
+          m = 64;
+        for (unsigned long j = 0; j < m && n < cap; j++) {
+          pt[n].x = sg[i].control_points[j].point.x;
+          pt[n].y = sg[i].control_points[j].point.y;
+          n++;
+        }
+      }
+    }
   }
-  if (m >= 3)
-    emit_polygon(b, pts, m, color, DPS_SOLID, 1);
-  free(pts);
+  *out_n = n;
+  return pt;
 }
 
 static void entity_hatch(MBlock *b, Dwg_Data *dwg, Dwg_Entity_HATCH *h,
@@ -1069,6 +1104,44 @@ static void entity_hatch(MBlock *b, Dwg_Data *dwg, Dwg_Entity_HATCH *h,
   unsigned long np = h->num_paths;
   if (np > 10000)
     np = 10000;
+
+  /* 1) заливка: сплошная — как есть; узорная — штриховым брашем */
+  {
+    MPt *pts = NULL;
+    int n = 0;
+    for (unsigned long i = 0; i < np && !pts; i++) {
+      int cnt = 0;
+      MPt *pp = hatch_loop_pts(&h->paths[i], &cnt);
+      if (pp && cnt >= 3) {
+        pts = pp;
+        n = cnt;
+      } else if (pp) {
+        free(pp);
+      }
+    }
+    if (pts && n >= 3) {
+      int style = 1; /* сплошная заливка */
+      if (!h->is_solid_fill) {
+        double ang = (h->deflines && h->num_deflines) ? h->deflines[0].angle
+                                                      : 45.0;
+        double a = fmod(fabs(ang) * 180.0 / M_PI, 180.0);
+        if (a < 22.5 || a >= 157.5)
+          style = 4; /* горизонтальный узор */
+        else if (a < 67.5)
+          style = 2; /* 45° */
+        else if (a < 112.5)
+          style = 5; /* вертикальный */
+        else
+          style = 3; /* 135° */
+        if (h->double_flag)
+          style = 6; /* перекрестный */
+      }
+      emit_polygon(b, pts, n, color, DPS_SOLID, style);
+      free(pts);
+    }
+  }
+
+  /* 2) контуры петель */
   for (unsigned long i = 0; i < np; i++) {
     Dwg_HATCH_Path *path = &h->paths[i];
     if (path->flag & 2)
@@ -1076,9 +1149,6 @@ static void entity_hatch(MBlock *b, Dwg_Data *dwg, Dwg_Entity_HATCH *h,
     else
       hatch_path_segs(b, path, color, pen);
   }
-  /* solid fill: fill the first closed loop */
-  if (h->is_solid_fill && h->paths[0].flag & 2)
-    hatch_fill_loop(b, &h->paths[0], color);
 }
 
 static void host_3dsolid_wire(MBlock *b, Dwg_3DSOLID_wire *w, COLORREF color,

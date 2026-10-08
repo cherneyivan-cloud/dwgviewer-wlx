@@ -52,14 +52,17 @@ int main(int argc, char **argv)
              m->blocks[i].n_inserts, tag);
     }
   }
-  long long tot_poly = 0, tot_text = 0, tot_ins = 0;
+  long long tot_poly = 0, tot_text = 0, tot_ins = 0, tot_fill = 0;
   for (int i = 0; i < m->n_blocks; i++) {
     MBlock *b = &m->blocks[i];
     int np = 0, nt = 0, ni = b->n_inserts;
     int bad = 0;
     for (int j = 0; j < b->n_prims; j++) {
-      if (b->prims[j].kind == KP_POLY)
+      if (b->prims[j].kind == KP_POLY) {
         np++;
+        if (b->prims[j].fill)
+          tot_fill++;
+      }
       else if (b->prims[j].kind == KP_TEXT)
         nt++;
       else if (b->prims[j].kind == KP_POINT)
@@ -78,8 +81,8 @@ int main(int argc, char **argv)
     tot_text += nt;
     tot_ins += ni;
   }
-  printf("totals: poly=%lld text=%lld inserts=%lld\n", tot_poly, tot_text,
-         tot_ins);
+  printf("totals: poly=%lld text=%lld inserts=%lld fills=%lld\n", tot_poly, tot_text,
+         tot_ins, tot_fill);
   model_free(m);
   return 0;
 }

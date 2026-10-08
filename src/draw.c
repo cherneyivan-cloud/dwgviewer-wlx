@@ -356,10 +356,30 @@ static void draw_prim(HDC hdc, KPrim *p, const XForm *xf, const DrawOpts *o,
   HPEN pen = get_pen(pc, col, p->pen, o->pen_width);
   HPEN oldpen = (HPEN)SelectObject(hdc, pen);
   if (p->fill) {
-    HBRUSH br = get_brush(pc, (DWORD)col);
+    HBRUSH br;
+    int del = 0;
+    if (p->fill == 1) {
+      br = get_brush(pc, (DWORD)col);
+    } else {
+      int st;
+      switch (p->fill) {
+      case 2: st = HS_BDIAGONAL; break;
+      case 3: st = HS_FDIAGONAL; break;
+      case 4: st = HS_HORIZONTAL; break;
+      case 5: st = HS_VERTICAL; break;
+      case 6: st = HS_DIAGCROSS; break;
+      default: st = HS_BDIAGONAL; break;
+      }
+      br = CreateHatchBrush(st, col);
+      del = 1;
+      /* фон штрихового браша = фон окна, чтобы не закрашивать промежутки */
+      SetBkColor(hdc, o->bg_white ? RGB(255, 255, 255) : RGB(0, 0, 0));
+    }
     HBRUSH oldbr = (HBRUSH)SelectObject(hdc, br);
     Polygon(hdc, dev, n);
     SelectObject(hdc, oldbr);
+    if (del)
+      DeleteObject(br);
   } else {
     Polyline(hdc, dev, n);
   }
