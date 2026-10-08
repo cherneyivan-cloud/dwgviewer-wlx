@@ -186,7 +186,6 @@ static int ent_pen_style(Dwg_Data *dwg, Dwg_Object_Entity *ent)
    Возвращает длину в байтах (>=0) либо -1, если строка не UTF-16LE. */
 static int detect_utf16le_len(const unsigned char *s)
 {
-  int cs = (int)strlen((const char *)s);
   int i = 0, pairs = 0;
   while (i + 1 < 8190) {
     unsigned char lo = s[i];
@@ -194,14 +193,17 @@ static int detect_utf16le_len(const unsigned char *s)
     if (lo == 0 && hi == 0)
       return (i >= 2) ? i : -1; /* нашли терминатор 0000 */
     /* допустимые старшие байты: Latin (00), кириллица (04/05),
-       общая пунктуация/символы (20..23) */
+       общая пунктуация/символы (20..27) */
     if (!(hi == 0x00 || hi == 0x04 || hi == 0x05 ||
-          (hi >= 0x20 && hi <= 0x23)))
+          (hi >= 0x20 && hi <= 0x27)))
       return -1;
     i += 2;
     pairs++;
-    /* не заходим далеко за конец C-строки (защита от чтения «мимо») */
-    if (i > cs + 64 || pairs > 4096)
+    /* Защита от чтения «мимо»: раньше здесь использовался strlen(), но для
+       UTF-16LE он обрывается на первом нулевом байте и любая строка длиннее
+       ~32 символов не распознавалась (текст терялся). Ограничиваем только
+       разумной длиной. */
+    if (i > 4096 || pairs > 2048)
       return -1;
   }
   return -1;
