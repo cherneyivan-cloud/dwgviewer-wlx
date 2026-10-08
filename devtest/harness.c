@@ -243,6 +243,19 @@ int main(int argc, char **argv)
   int cw = cc.right - cc.left;
   int ch = cc.bottom - cc.top;
   printf("child client: %dx%d\n", cw, ch);
+  /* Зум колесом к центру (как делает пользователь), чтобы блоки/текст были
+     не в субпиксельном масштабе. */
+  {
+    POINT c;
+    c.x = cw / 2;
+    c.y = ch / 2;
+    ClientToScreen(child, &c);
+    for (int i = 0; i < 15; i++)
+      SendMessageW(child, WM_MOUSEWHEEL, MAKEWPARAM(0, 120),
+                   MAKELPARAM(c.x, c.y));
+    RedrawWindow(child, NULL, NULL,
+                 RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+  }
   capture_window(child, cw, ch, out2);
   printf("[h after capture]\n");
 

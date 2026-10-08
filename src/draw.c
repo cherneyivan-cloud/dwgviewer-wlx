@@ -2,6 +2,7 @@
    Part of DWG Viewer plugin for Total Commander (WLX).
    GPLv3+ */
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <math.h>
 #include <wchar.h>
@@ -401,10 +402,12 @@ static void draw_block_rec(HDC hdc, DwgModel *m, int bi, const XForm *parent,
       continue;
     if (fabs(ir->scale[0]) > 1e12 || fabs(ir->scale[1]) > 1e12)
       continue;
-    XForm t = *parent;
-    xf_translate(&t, ir->pos.x, ir->pos.y);
+    XForm t;
+    xf_identity(&t);
+    xf_scale(&t, ir->scale[0], ir->scale[1]); /* применяется к точке блока */
     xf_rotate(&t, ir->rot);
-    xf_scale(&t, ir->scale[0], ir->scale[1]);
+    xf_translate(&t, ir->pos.x, ir->pos.y);
+    xf_mul(&t, parent);                        /* t = parent ∘ (T∘R∘S) */
     draw_block_rec(hdc, m, ir->target, &t, o, depth + 1, cw, ch, draw_text,
                    pc, fc);
   }

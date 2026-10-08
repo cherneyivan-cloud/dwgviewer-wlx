@@ -52,7 +52,8 @@ int main(int argc, char **argv)
              m->blocks[i].n_inserts, tag);
     }
   }
-  long long tot_poly = 0, tot_text = 0, tot_ins = 0, tot_fill = 0;
+  long long tot_poly = 0, tot_text = 0, tot_ins = 0, tot_fill = 0,
+            tot_badins = 0;
   for (int i = 0; i < m->n_blocks; i++) {
     MBlock *b = &m->blocks[i];
     int np = 0, nt = 0, ni = b->n_inserts;
@@ -80,9 +81,12 @@ int main(int argc, char **argv)
     tot_poly += np;
     tot_text += nt;
     tot_ins += ni;
+    for (int k = 0; k < b->n_inserts; k++)
+      if (b->inserts[k].target < 0)
+        tot_badins++;
   }
-  printf("totals: poly=%lld text=%lld inserts=%lld fills=%lld\n", tot_poly, tot_text,
-         tot_ins, tot_fill);
+  printf("totals: poly=%lld text=%lld inserts=%lld fills=%lld badins=%lld\n",
+         tot_poly, tot_text, tot_ins, tot_fill, tot_badins);
   model_free(m);
   return 0;
 }

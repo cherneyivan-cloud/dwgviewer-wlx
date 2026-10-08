@@ -1452,10 +1452,12 @@ static void block_extents(DwgModel *m, int bi, XForm *xf, int depth)
     MInsert *ir = &b->inserts[i];
     if (ir->target < 0)
       continue;
-    XForm t = *xf;
-    xf_translate(&t, ir->pos.x, ir->pos.y);
-    xf_rotate(&t, ir->rot);
+    XForm t;
+    xf_identity(&t);
     xf_scale(&t, ir->scale[0], ir->scale[1]);
+    xf_rotate(&t, ir->rot);
+    xf_translate(&t, ir->pos.x, ir->pos.y);
+    xf_mul(&t, xf); /* t = xf ∘ (T∘R∘S) */
     block_extents(m, ir->target, &t, depth + 1);
   }
 }
@@ -1590,8 +1592,10 @@ DwgModel *model_load(const wchar_t *path, wchar_t *errbuf, int errlen)
     model_free(m);
     return NULL;
   }
+  /* Проход 1: сначала назначаем ключи ВСЕМ блокам, чтобы INSERT мог ссылаться
+     на блок, определённый позже (иначе «вперёд»-ссылки не разрешаются и
+     содержимое блоков не выводится). */
   int bi = 0;
-  BuildCtx ctx = { m, dwg, 0, 0 };
   for (unsigned int i = 0; i < dwg->num_objects; i++) {
     Dwg_Object *obj = &dwg->object[i];
     if (obj->supertype != DWG_SUPERTYPE_OBJECT ||
@@ -1599,6 +1603,16 @@ DwgModel *model_load(const wchar_t *path, wchar_t *errbuf, int errlen)
       continue;
     m->blocks[bi].id = bi;
     m->blocks[bi].key = (const void *)obj;
+    bi++;
+  }
+  /* Проход 2: строим содержимое блоков (теперь все ключи уже проставлены). */
+  BuildCtx ctx = { m, dwg, 0, 0 };
+  bi = 0;
+  for (unsigned int i = 0; i < dwg->num_objects; i++) {
+    Dwg_Object *obj = &dwg->object[i];
+    if (obj->supertype != DWG_SUPERTYPE_OBJECT ||
+        obj->fixedtype != DWG_TYPE_BLOCK_HEADER)
+      continue;
     ctx.blk = bi;
     build_canvas(&ctx, obj, 1);
     bi++;
