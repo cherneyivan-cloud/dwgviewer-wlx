@@ -250,25 +250,76 @@ static void draw_text_prim(HDC hdc, KPrim *p, const XForm *xf,
   SetBkMode(hdc, TRANSPARENT);
   SetTextColor(hdc, adjust_color(p->color, bg_white));
 
-  /* split into lines */
+  /* split into lines; при заданной ширине рамки — переносим по словам */
   double px0, py0;
   xf_apply(xf, p->pos.x, p->pos.y, &px0, &py0);
   const wchar_t *s = p->text;
   int line = 0;
   double lsp = hpx * 1.33;
+  double wscale = hypot(dirx, diry);
+  if (wscale < 1e-9)
+    wscale = 1.0;
+  double maxpx = (p->wrap_width > 0) ? p->wrap_width * wscale : 0.0;
+  wchar_t buf[4096];
+
   while (s && *s) {
     const wchar_t *nl = wcschr(s, L'\n');
-    int len = nl ? (int)(nl - s) : -1;
-    if (len >= 0 && nl) {
-      TextOutW(hdc, (int)(px0 + 0.5), (int)(py0 + line * lsp + 0.5), s, len);
-      s = nl + 1;
+    int plen = nl ? (int)(nl - s) : (int)wcslen(s);
+    if (plen < 0)
+      plen = 0;
+    if (maxpx <= 1.0) {
+      if (plen > 0)
+        TextOutW(hdc, (int)(px0 + 0.5), (int)(py0 + line * lsp + 0.5), s,
+                 plen);
+      line++;
     } else {
-      TextOutW(hdc, (int)(px0 + 0.5), (int)(py0 + line * lsp + 0.5), s,
-               (int)wcslen(s));
-      break;
+      int i = 0;
+      while (i < plen) {
+        int count = 0, k = i;
+        while (k < plen) {
+          int wend = k;
+          while (wend < plen && s[wend] != L' ')
+            wend++;
+          int cand = wend - i;
+          if (cand > 4090)
+            cand = 4090;
+          memcpy(buf, s + i, (size_t)cand * sizeof(wchar_t));
+          buf[cand] = 0;
+          SIZE sz;
+          GetTextExtentPoint32W(hdc, buf, cand, &sz);
+          if ((double)sz.cx <= maxpx) {
+            count = cand;
+            k = (wend < plen) ? wend + 1 : wend;
+            if (wend >= plen)
+              break;
+          } else {
+            break;
+          }
+        }
+        if (count == 0) { /* слово шире рамки — выводим его целиком */
+          int wend = i;
+          while (wend < plen && s[wend] != L' ')
+            wend++;
+          count = wend - i;
+          if (count == 0)
+            count = 1;
+        }
+        int drawLen = count;
+        while (drawLen > 0 && s[i + drawLen - 1] == L' ')
+          drawLen--;
+        if (drawLen > 0)
+          TextOutW(hdc, (int)(px0 + 0.5), (int)(py0 + line * lsp + 0.5),
+                   s + i, drawLen);
+        line++;
+        i += count;
+        while (i < plen && s[i] == L' ')
+          i++;
+        if (line > 256)
+          break;
+      }
     }
-    line++;
-    if (line > 64)
+    s = nl ? nl + 1 : NULL;
+    if (line > 256)
       break;
   }
   SetTextAlign(hdc, oldta);

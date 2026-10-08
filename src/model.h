@@ -36,6 +36,7 @@ typedef struct {
   MPt pos;
   double height;     /* model units */
   double rot;        /* radians */
+  double wrap_width; /* KP_TEXT: ширина рамки в ед. модели (0 = без переноса) */
   wchar_t *text;     /* may contain '\n' line breaks */
 } KPrim;
 

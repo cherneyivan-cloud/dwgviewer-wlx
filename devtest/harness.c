@@ -255,10 +255,17 @@ int main(int argc, char **argv)
      не в субпиксельном масштабе. */
   if (!getenv("HARNESS_NOZOOM")) {
     POINT c;
-    c.x = cw / 2;
-    c.y = ch / 2;
+    int zx = (int)(cw / 2), zy = (int)(ch / 2);
+    const char *ezx = getenv("HARNESS_ZX"), *ezy = getenv("HARNESS_ZY");
+    if (ezx) zx = cw * atoi(ezx) / 1000;
+    if (ezy) zy = ch * atoi(ezy) / 1000;
+    int zn = 15;
+    const char *ezn = getenv("HARNESS_Z");
+    if (ezn) zn = atoi(ezn);
+    c.x = zx;
+    c.y = zy;
     ClientToScreen(child, &c);
-    for (int i = 0; i < 15; i++)
+    for (int i = 0; i < zn; i++)
       SendMessageW(child, WM_MOUSEWHEEL, MAKEWPARAM(0, 120),
                    MAKELPARAM(c.x, c.y));
     RedrawWindow(child, NULL, NULL,

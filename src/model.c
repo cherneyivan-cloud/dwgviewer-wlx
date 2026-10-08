@@ -367,8 +367,17 @@ static wchar_t *make_text_w(const char *utf8)
   return finish_text_w(wbuf);
 }
 
+static void emit_text_wrap(MBlock *b, MPt pos, double height, double rot,
+                           const char *utf8, COLORREF color, double wrap);
+
 static void emit_text(MBlock *b, MPt pos, double height, double rot,
                       const char *utf8, COLORREF color)
+{
+  emit_text_wrap(b, pos, height, rot, utf8, color, 0.0);
+}
+
+static void emit_text_wrap(MBlock *b, MPt pos, double height, double rot,
+                           const char *utf8, COLORREF color, double wrap)
 {
   if (height <= 0 || height > 1e12)
     height = 1e-5;
@@ -384,6 +393,7 @@ static void emit_text(MBlock *b, MPt pos, double height, double rot,
   p->pos = pos;
   p->height = height;
   p->rot = rot;
+  p->wrap_width = (is_fin(wrap) && wrap > 0) ? wrap : 0.0;
   p->text = w;
 }
 
@@ -859,7 +869,7 @@ static void entity_mtext(MBlock *b, Dwg_Data *dwg, Dwg_Entity_MTEXT *e,
   if (is_fin(e->x_axis_dir.x) && is_fin(e->x_axis_dir.y))
     rot = atan2(e->x_axis_dir.y, e->x_axis_dir.x);
   MPt pos = {e->ins_pt.x, e->ins_pt.y};
-  emit_text(b, pos, e->text_height, rot, e->text, color);
+  emit_text_wrap(b, pos, e->text_height, rot, e->text, color, e->rect_width);
 }
 
 static void entity_leader(MBlock *b, Dwg_Entity_LEADER *e, COLORREF color,
