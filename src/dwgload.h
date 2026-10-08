@@ -32,6 +32,12 @@ Dwg_Object_Ref *dwg_paper_space_ref(Dwg_Data *restrict dwg);
 /* non-NULL error text if the runtime library could not be loaded */
 const wchar_t *dwg_lib_error(void);
 
+/* Получить текстовое поле сущности в UTF-8 через динамический API
+   LibreDWG (корректно работает с UCS-2/UTF-16 строками и пробелами).
+   Возвращает 1 при успехе; *isnew=1 означает, что *textp нужно free(). */
+int dwg_utf8text(void *entity, const char *name, const char *field,
+                 char **textp, int *isnew);
+
 #ifdef __cplusplus
 }
 #endif

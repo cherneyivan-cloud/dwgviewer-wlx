@@ -14,6 +14,8 @@ typedef Dwg_Object *(*fn_ref_object)(Dwg_Data *, Dwg_Object_Ref *);
 typedef Dwg_Object *(*fn_first_owned)(const Dwg_Object *);
 typedef Dwg_Object *(*fn_next_owned)(const Dwg_Object *, const Dwg_Object *);
 typedef Dwg_Object_Ref *(*fn_space_ref)(Dwg_Data *);
+typedef int (*fn_utf8text)(void *, const char *, const char *, char **, int *,
+                           void *);
 
 static fn_read_file p_read_file;
 static fn_free p_free;
@@ -23,6 +25,7 @@ static fn_first_owned p_first_owned;
 static fn_next_owned p_next_owned;
 static fn_space_ref p_model_space_ref;
 static fn_space_ref p_paper_space_ref;
+static fn_utf8text p_utf8text;
 
 static int g_tried; /* 0 = not tried yet, 1 = ok, -1 = failed */
 static wchar_t g_error[128];
@@ -66,6 +69,7 @@ lib_init(void)
       (fn_space_ref)GetProcAddress(lib, "dwg_model_space_ref");
   p_paper_space_ref =
       (fn_space_ref)GetProcAddress(lib, "dwg_paper_space_ref");
+  p_utf8text = (fn_utf8text)GetProcAddress(lib, "dwg_dynapi_entity_utf8text");
 
   if (!p_read_file || !p_free || !p_version_type || !p_ref_object ||
       !p_first_owned || !p_next_owned || !p_model_space_ref ||
@@ -154,4 +158,18 @@ dwg_paper_space_ref(Dwg_Data *restrict dwg)
   if (g_tried < 0 || !p_paper_space_ref)
     return NULL;
   return p_paper_space_ref(dwg);
+}
+
+int
+dwg_utf8text(void *entity, const char *name, const char *field, char **textp,
+             int *isnew)
+{
+  lib_init();
+  if (isnew)
+    *isnew = 0;
+  if (textp)
+    *textp = NULL;
+  if (g_tried < 0 || !p_utf8text || !entity || !name || !field)
+    return 0;
+  return p_utf8text(entity, name, field, textp, isnew, NULL) ? 1 : 0;
 }

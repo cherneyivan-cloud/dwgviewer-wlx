@@ -164,6 +164,23 @@ static int ent_pen_style(Dwg_Data *dwg, Dwg_Object_Entity *ent)
 
 /* strip MTEXT formatting codes and convert to wide.
    The result is owned by the caller (wchar_t*). */
+/* Реальная длина UTF-16LE-строки в байтах: ищем нулевую 16-битную единицу
+   (0000 на чётной позиции).  Обычный strlen() не годится: у ASCII-символов
+   (пробел, дефис и т.п.) старший байт = 0x00, и strlen() обрывает строку на
+   первом таком символе. */
+static int u16_byte_len(const char *s)
+{
+  int i = 0;
+  while (i < 8190) {
+    unsigned char lo = (unsigned char)s[i];
+    unsigned char hi = (unsigned char)s[i + 1];
+    if (lo == 0 && hi == 0)
+      return i; /* терминатор — нулевая кодовая единица */
+    i += 2;
+  }
+  return i;
+}
+
 /* Определение UTF-16LE: LibreDWG для части DWG возвращает text_value как
    сырые байты UTF-16LE в char*.  Признак: байты на нечётных позициях — это
    старшие байты кодовой точки (0x00 для Latin, 0x04/0x05 для кириллицы). */
@@ -272,8 +289,10 @@ static wchar_t *make_text_w(const char *utf8)
     return NULL;
   /* LibreDWG возвращает часть текстов как сырые байты UTF-16LE в char*. */
   {
-    int rawlen = (int)strlen(utf8);
-    if (looks_utf16le((const unsigned char *)utf8, rawlen)) {
+    int uslen = (int)strlen(utf8);
+    if (uslen >= 2 &&
+        looks_utf16le((const unsigned char *)utf8, uslen)) {
+      int rawlen = u16_byte_len(utf8); /* настоящая длина (до 0000) */
       wchar_t wbuf[4096];
       int m = 0;
       for (int i = 0; i + 1 < rawlen && m < 4090; i += 2) {
