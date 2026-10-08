@@ -458,6 +458,70 @@ static void emit_arc_pts(MBlock *b, double cx, double cy, double r,
   free(pts);
 }
 
+/* Дуга со знаковым размахом span (может быть отрицательным: по часовой).
+   Раньше здесь использовалась emit_arc_pts(), которая всегда «доводит»
+   размах до положительного — из-за этого CW-дуги булджей превращались в
+   почти полную окружность (гигантские эллипсы в масштабированных блоках). */
+static void emit_arc_signed(MBlock *b, double cx, double cy, double r,
+                            double a0, double span, COLORREF color, int pen)
+{
+  if (!is_fin(cx) || !is_fin(cy) || !is_fin(r) || r <= 0)
+    return;
+  if (!is_fin(a0) || !is_fin(span))
+    return;
+  double as = fabs(span);
+  if (as < 1e-12)
+    return;
+  int n = (int)(as / (M_PI / 30.0)) + 2;
+  if (n < 4)
+    n = 4;
+  if (n > 480)
+    n = 480;
+  MPt *pts = (MPt *)malloc((size_t)n * sizeof(MPt));
+  if (!pts)
+    return;
+  for (int i = 0; i < n; i++) {
+    double a = a0 + span * (double)i / (double)(n - 1);
+    pts[i].x = cx + r * cos(a);
+    pts[i].y = cy + r * sin(a);
+  }
+  emit_polygon(b, pts, n, color, pen, 0);
+  free(pts);
+}
+
+/* Булдж -> параметры дуги (центр, радиус, начало, знаковый размах).
+   b = tan(theta/4), theta — знаковый вписанный угол (b>0 — против часовой).
+   Возвращает 1 при успехе. */
+static int bulge_to_arc(MPt p0, MPt p1, double b,
+                        double *cx, double *cy, double *r,
+                        double *a0, double *span)
+{
+  if (!is_fin(b) || b == 0.0)
+    return 0;
+  double dx = p1.x - p0.x, dy = p1.y - p0.y;
+  double c = sqrt(dx * dx + dy * dy);
+  if (!(c > 1e-12))
+    return 0;
+  double theta = 4.0 * atan(b);
+  if (!is_fin(theta) || fabs(theta) < 1e-12)
+    return 0;
+  double rr = c / (2.0 * sin(theta / 2.0));
+  if (!is_fin(rr))
+    return 0;
+  double R = fabs(rr);
+  double sag = fabs(b) * c / 2.0;   /* стрелка прогиба */
+  double h = R - sag;
+  double perpx = -dy / c, perpy = dx / c; /* левая нормаль к хорде */
+  double sign = (b > 0.0) ? 1.0 : -1.0;   /* центр — напротив прогиба */
+  double mx = (p0.x + p1.x) / 2.0, my = (p0.y + p1.y) / 2.0;
+  *cx = mx + sign * perpx * h;
+  *cy = my + sign * perpy * h;
+  *r = R;
+  *a0 = atan2(p0.y - *cy, p0.x - *cx);
+  *span = theta;
+  return 1;
+}
+
 static void emit_point(MBlock *b, double x, double y, COLORREF color)
 {
   if (!is_fin(x) || !is_fin(y))
@@ -608,43 +672,10 @@ static void emit_polyline_bulge(MBlock *b, const MPt *pts, int n,
     int i0 = i;
     int i1 = closed ? (i + 1) % n : i + 1;
     double bx = bulges ? bulges[i0] : 0.0;
-    if (bx != 0.0) {
-      /* arc between pts[i0] and pts[i1] with bulge bx */
-      double dx = pts[i1].x - pts[i0].x;
-      double dy = pts[i1].y - pts[i0].y;
-      double chord = sqrt(dx * dx + dy * dy);
-      if (chord < 1e-12) {
-        emit_line(b, pts[i0].x, pts[i0].y, pts[i1].x, pts[i1].y, color, pen);
-        continue;
-      }
-      double theta = 4.0 * atan(bx);
-      if (theta < 0)
-        theta += 2 * M_PI;
-      double r = (chord / 2.0) / sin(theta >= M_PI ? (2 * M_PI - theta) / 2 : theta / 2);
-      if (r < 0)
-        r = -r;
-      double mx = (pts[i0].x + pts[i1].x) / 2.0;
-      double my = (pts[i0].y + pts[i1].y) / 2.0;
-      double d = sqrt(dx * dx + dy * dy);
-      double h = sqrt(r * r - (d / 2.0) * (d / 2.0));
-      if (!is_fin(h))
-        h = 0;
-      double px = -dy / d;
-      double py = dx / d;
-      double dir = (bx > 0) ? -1.0 : 1.0;
-      double cx = mx + dir * px * h;
-      double cy = my + dir * py * h;
-      double a0 = atan2(pts[i0].y - cy, pts[i0].x - cx);
-      double a1 = atan2(pts[i1].y - cy, pts[i1].x - cx);
-      double span = a1 - a0;
-      if (bx > 0) {
-        while (span <= 0)
-          span += 2 * M_PI;
-      } else {
-        while (span >= 0)
-          span -= 2 * M_PI;
-      }
-      emit_arc_pts(b, cx, cy, r, a0, a0 + span, color, pen);
+    double cx, cy, r, a0, span;
+    if (bx != 0.0 &&
+        bulge_to_arc(pts[i0], pts[i1], bx, &cx, &cy, &r, &a0, &span)) {
+      emit_arc_signed(b, cx, cy, r, a0, span, color, pen);
     } else {
       emit_line(b, pts[i0].x, pts[i0].y, pts[i1].x, pts[i1].y, color, pen);
     }
@@ -968,6 +999,101 @@ static void hatch_path_polyline(MBlock *b, Dwg_HATCH_Path *path,
   free(pts);
 }
 
+/* ---- дуги HATCH ----
+   Углы дуг HATCH в DWG заданы в OCS-параметризации, которая может быть
+   зеркальной по оси X. «Прямое» использование углов давало почти полную
+   окружность (гигантские «круги» при заливке). Зеркальность sgn=+1/-1
+   выбираем по совпадению начала дуги с концом предыдущего сегмента, а при
+   отсутствии опоры — по флагу is_ccw. */
+
+static MPt hatch_arc_pt(double cx, double cy, double r, double sgn, double a)
+{
+  MPt p;
+  p.x = cx + r * cos(sgn * a);
+  p.y = cy + r * sin(sgn * a);
+  return p;
+}
+
+static MPt hatch_ell_pt(double cx, double cy, double ex, double ey, double ratio,
+                        double sgn, double t)
+{
+  MPt p;
+  double c = cos(sgn * t), s = sin(sgn * t);
+  p.x = cx + ex * c - ey * ratio * s;
+  p.y = cy + ey * c + ex * ratio * s;
+  return p;
+}
+
+/* Выбор зеркальности: по совпадению с опорной точкой ref (если есть),
+   иначе по направлению is_ccw. */
+static double hatch_pick_sign(MPt p1, MPt p2, MPt ref, int have_ref, int is_ccw)
+{
+  if (!have_ref)
+    return is_ccw ? 1.0 : -1.0;
+  double d1 = (p1.x - ref.x) * (p1.x - ref.x) + (p1.y - ref.y) * (p1.y - ref.y);
+  double d2 = (p2.x - ref.x) * (p2.x - ref.x) + (p2.y - ref.y) * (p2.y - ref.y);
+  return (d2 < d1) ? -1.0 : 1.0;
+}
+
+static int hatch_arc_add(double cx, double cy, double r, double a0, double a1,
+                         double sgn, int skip_first, MPt *out, int cap)
+{
+  int n = 0;
+  if (!is_fin(cx) || !is_fin(cy) || !is_fin(r) || r <= 0)
+    return 0;
+  if (!is_fin(a0) || !is_fin(a1))
+    return 0;
+  double sweep = a1 - a0;
+  while (sweep < 0)
+    sweep += 2 * M_PI;
+  while (sweep >= 2 * M_PI)
+    sweep -= 2 * M_PI;
+  if (sweep < 1e-12)
+    sweep = 2 * M_PI; /* совпадающие углы — полная окружность */
+  int steps = (int)(sweep / (M_PI / 30.0)) + 1;
+  if (steps < 2)
+    steps = 2;
+  if (steps > 240)
+    steps = 240;
+  int i0 = (skip_first && steps > 1) ? 1 : 0;
+  for (int i = i0; i <= steps && n < cap; i++) {
+    double a = a0 + sweep * (double)i / (double)steps;
+    out[n] = hatch_arc_pt(cx, cy, r, sgn, a);
+    n++;
+  }
+  return n;
+}
+
+static int hatch_ell_add(double cx, double cy, double ex, double ey, double ratio,
+                         double a0, double a1, double sgn, int skip_first,
+                         MPt *out, int cap)
+{
+  int n = 0;
+  if (!is_fin(cx) || !is_fin(cy) || !is_fin(ex) || !is_fin(ey))
+    return 0;
+  if (!(ratio > 0))
+    ratio = 1.0;
+  double sweep = a1 - a0;
+  while (sweep < 0)
+    sweep += 2 * M_PI;
+  while (sweep >= 2 * M_PI)
+    sweep -= 2 * M_PI;
+  if (sweep < 1e-12)
+    sweep = 2 * M_PI;
+  int steps = (int)(sweep / (M_PI / 30.0)) + 1;
+  if (steps < 2)
+    steps = 2;
+  if (steps > 240)
+    steps = 240;
+  int i0 = (skip_first && steps > 1) ? 1 : 0;
+  for (int i = i0; i <= steps && n < cap; i++) {
+    double t = a0 + sweep * (double)i / (double)steps;
+    out[n] = hatch_ell_pt(cx, cy, ex, ey, ratio, sgn, t);
+    n++;
+  }
+  return n;
+}
+
 static void hatch_path_segs(MBlock *b, Dwg_HATCH_Path *path, COLORREF color,
                             int pen)
 {
@@ -977,40 +1103,46 @@ static void hatch_path_segs(MBlock *b, Dwg_HATCH_Path *path, COLORREF color,
     return;
   if (n > 200000)
     n = 200000;
+  MPt last = { 0, 0 };
+  int have = 0;
   for (unsigned long i = 0; i < n; i++) {
     Dwg_HATCH_PathSeg *s = &segs[i];
     switch (s->curve_type) {
     case 1: /* line */
       emit_line(b, s->first_endpoint.x, s->first_endpoint.y,
                 s->second_endpoint.x, s->second_endpoint.y, color, pen);
+      last.x = s->second_endpoint.x;
+      last.y = s->second_endpoint.y;
+      have = 1;
       break;
     case 2: { /* circular arc */
-      double a0 = s->start_angle, a1 = s->end_angle;
-      if (!s->is_ccw) {
-        double t = a0;
-        a0 = a1;
-        a1 = t;
-      }
-      emit_arc_pts(b, s->center.x, s->center.y, s->radius, a0, a1, color, pen);
+      MPt p1 = hatch_arc_pt(s->center.x, s->center.y, s->radius, 1.0,
+                            s->start_angle);
+      MPt p2 = hatch_arc_pt(s->center.x, s->center.y, s->radius, -1.0,
+                            s->start_angle);
+      double sgn = hatch_pick_sign(p1, p2, last, have, s->is_ccw);
+      MPt tmp[260];
+      int m = hatch_arc_add(s->center.x, s->center.y, s->radius,
+                            s->start_angle, s->end_angle, sgn, 0, tmp, 260);
+      if (m >= 2)
+        emit_polygon(b, tmp, m, color, pen, 0);
+      if (m > 0) { last = tmp[m - 1]; have = 1; }
       break;
     }
-    case 3: { /* elliptical arc, approximated */
+    case 3: { /* elliptical arc */
       double cxx = s->center.x, cyy = s->center.y;
       double ex = s->endpoint.x - cxx, ey = s->endpoint.y - cyy;
-      if (!is_fin(cxx) || !is_fin(cyy) || !is_fin(ex) || !is_fin(ey))
-        break;
-      double ratio = s->minor_major_ratio > 0 ? s->minor_major_ratio : 1.0;
-      double a0 = s->start_angle, a1 = s->end_angle;
-      double span = a1 - a0;
-      int nn = 16;
-      MPt tmp[40];
-      for (int j = 0; j < nn; j++) {
-        double t = a0 + span * (double)j / (double)(nn - 1);
-        double c = cos(t), sn = sin(t);
-        tmp[j].x = cxx + ex * c - ey * ratio * sn;
-        tmp[j].y = cyy + ey * c + ex * ratio * sn;
-      }
-      emit_polygon(b, tmp, nn, color, pen, 0);
+      MPt p1 = hatch_ell_pt(cxx, cyy, ex, ey, s->minor_major_ratio, 1.0,
+                            s->start_angle);
+      MPt p2 = hatch_ell_pt(cxx, cyy, ex, ey, s->minor_major_ratio, -1.0,
+                            s->start_angle);
+      double sgn = hatch_pick_sign(p1, p2, last, have, s->is_ccw);
+      MPt tmp[260];
+      int m = hatch_ell_add(cxx, cyy, ex, ey, s->minor_major_ratio,
+                            s->start_angle, s->end_angle, sgn, 0, tmp, 260);
+      if (m >= 2)
+        emit_polygon(b, tmp, m, color, pen, 0);
+      if (m > 0) { last = tmp[m - 1]; have = 1; }
       break;
     }
     case 4: /* spline via control points */
@@ -1058,38 +1190,20 @@ static MPt *hatch_loop_pts(Dwg_HATCH_Path *path, int *out_n)
       if (bg != 0.0 && n < cap - 2) {
         MPt a = { pl[i].point.x, pl[i].point.y };
         MPt c_ = { pl[(i + 1) % np].point.x, pl[(i + 1) % np].point.y };
-        double dx = c_.x - a.x, dy = c_.y - a.y, chord = sqrt(dx * dx + dy * dy);
-        if (chord < 1e-12)
-          continue;
-        double theta = 4.0 * atan(bg);
-        if (theta < 0)
-          theta += 2 * M_PI;
-        double r = (chord / 2.0) /
-                   sin(theta >= M_PI ? (2 * M_PI - theta) / 2 : theta / 2);
-        if (r < 0)
-          r = -r;
-        double mx = (a.x + c_.x) / 2.0, my = (a.y + c_.y) / 2.0;
-        double h = sqrt(r * r - (chord / 2.0) * (chord / 2.0));
-        if (!is_fin(h))
-          h = 0;
-        double dir = (bg > 0) ? -1.0 : 1.0;
-        double cx = mx + dir * (-dy / chord) * h;
-        double cy = my + dir * (dx / chord) * h;
-        double t0 = atan2(a.y - cy, a.x - cx);
-        double t1 = atan2(c_.y - cy, c_.x - cx);
-        double span = t1 - t0;
-        if (bg > 0) {
-          while (span <= 0)
-            span += 2 * M_PI;
-        } else {
-          while (span >= 0)
-            span -= 2 * M_PI;
-        }
-        for (int k = 1; k < 6 && n < cap; k++) {
-          double t = t0 + span * (double)k / 6.0;
-          pt[n].x = cx + r * cos(t);
-          pt[n].y = cy + r * sin(t);
-          n++;
+        double cx, cy, r, t0, span;
+        if (bulge_to_arc(a, c_, bg, &cx, &cy, &r, &t0, &span)) {
+          double as = fabs(span);
+          int steps = (int)(as / (M_PI / 30.0)) + 1;
+          if (steps < 2)
+            steps = 2;
+          if (steps > 240)
+            steps = 240;
+          for (int k = 1; k <= steps && n < cap; k++) {
+            double t = t0 + span * (double)k / (double)steps;
+            pt[n].x = cx + r * cos(t);
+            pt[n].y = cy + r * sin(t);
+            n++;
+          }
         }
       }
     }
@@ -1100,45 +1214,54 @@ static MPt *hatch_loop_pts(Dwg_HATCH_Path *path, int *out_n)
       free(pt);
       return NULL;
     }
+    MPt last = { 0, 0 };
+    int have = 0;
     for (unsigned long i = 0; i < ns && n < cap; i++) {
-      if (sg[i].curve_type == 1) { /* линия */
-        pt[n].x = sg[i].first_endpoint.x;
-        pt[n].y = sg[i].first_endpoint.y;
-        n++;
-      } else if (sg[i].curve_type == 2) { /* дуга */
-        double a0 = sg[i].start_angle, a1 = sg[i].end_angle;
-        if (!sg[i].is_ccw) { double t = a0; a0 = a1; a1 = t; }
-        double span = a1 - a0;
-        while (span < 0) span += 2 * M_PI;
-        if (span < 1e-9) span += 2 * M_PI;
-        for (int k = 0; k < 8 && n < cap; k++) {
-          double t = a0 + span * (double)k / 8.0;
-          pt[n].x = sg[i].center.x + sg[i].radius * cos(t);
-          pt[n].y = sg[i].center.y + sg[i].radius * sin(t);
+      Dwg_HATCH_PathSeg *s = &sg[i];
+      if (s->curve_type == 1) { /* линия */
+        if (!have) {
+          pt[n].x = s->first_endpoint.x;
+          pt[n].y = s->first_endpoint.y;
           n++;
         }
-      } else if (sg[i].curve_type == 3) { /* эллиптическая дуга */
-        double cxx = sg[i].center.x, cyy = sg[i].center.y;
-        double ex = sg[i].endpoint.x - cxx, ey = sg[i].endpoint.y - cyy;
-        double ratio = sg[i].minor_major_ratio > 0 ? sg[i].minor_major_ratio : 1.0;
-        double a0 = sg[i].start_angle, a1 = sg[i].end_angle;
-        double span = a1 - a0;
-        for (int k = 0; k < 10 && n < cap; k++) {
-          double t = a0 + span * (double)k / 10.0, c = cos(t), s = sin(t);
-          pt[n].x = cxx + ex * c - ey * ratio * s;
-          pt[n].y = cyy + ey * c + ex * ratio * s;
-          n++;
-        }
-      } else if (sg[i].curve_type == 4 &&
-                 sg[i].control_points) { /* сплайн — по контрольным точкам */
-        unsigned long m = sg[i].num_control_points;
+        last.x = s->second_endpoint.x;
+        last.y = s->second_endpoint.y;
+        have = 1;
+      } else if (s->curve_type == 2) { /* дуга */
+        MPt p1 = hatch_arc_pt(s->center.x, s->center.y, s->radius, 1.0,
+                              s->start_angle);
+        MPt p2 = hatch_arc_pt(s->center.x, s->center.y, s->radius, -1.0,
+                              s->start_angle);
+        double sgn = hatch_pick_sign(p1, p2, last, have, s->is_ccw);
+        int m = hatch_arc_add(s->center.x, s->center.y, s->radius,
+                              s->start_angle, s->end_angle, sgn, have ? 1 : 0,
+                              pt + n, cap - n);
+        n += m;
+        if (m > 0 && n > 0) { last = pt[n - 1]; have = 1; }
+      } else if (s->curve_type == 3) { /* эллиптическая дуга */
+        double cxx = s->center.x, cyy = s->center.y;
+        double ex = s->endpoint.x - cxx, ey = s->endpoint.y - cyy;
+        MPt p1 = hatch_ell_pt(cxx, cyy, ex, ey, s->minor_major_ratio, 1.0,
+                              s->start_angle);
+        MPt p2 = hatch_ell_pt(cxx, cyy, ex, ey, s->minor_major_ratio, -1.0,
+                              s->start_angle);
+        double sgn = hatch_pick_sign(p1, p2, last, have, s->is_ccw);
+        int m = hatch_ell_add(cxx, cyy, ex, ey, s->minor_major_ratio,
+                              s->start_angle, s->end_angle, sgn, have ? 1 : 0,
+                              pt + n, cap - n);
+        n += m;
+        if (m > 0 && n > 0) { last = pt[n - 1]; have = 1; }
+      } else if (s->curve_type == 4 &&
+                 s->control_points) { /* сплайн — по контрольным точкам */
+        unsigned long m = s->num_control_points;
         if (m > 64)
           m = 64;
         for (unsigned long j = 0; j < m && n < cap; j++) {
-          pt[n].x = sg[i].control_points[j].point.x;
-          pt[n].y = sg[i].control_points[j].point.y;
+          pt[n].x = s->control_points[j].point.x;
+          pt[n].y = s->control_points[j].point.y;
           n++;
         }
+        if (n > 0) { last = pt[n - 1]; have = 1; }
       }
     }
   }
