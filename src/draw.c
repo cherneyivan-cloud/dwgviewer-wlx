@@ -203,12 +203,16 @@ static HFONT text_font(TextFontEnt *c, int h, int esc)
 static COLORREF adjust_color(COLORREF c, int bg_white)
 {
   int r = GetRValue(c), g = GetGValue(c), b = GetBValue(c);
-  int lum = (r * 299 + g * 587 + b * 114) / 1000;
+  int mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+  int mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
   if (!bg_white) {
-    if (lum < 45)
+    /* на чёрном фоне невидимы только почти-чёрные цвета (делаем белыми);
+       насыщенные (синий/зелёный/красный) сохраняем */
+    if (mx < 24)
       return RGB(255, 255, 255);
   } else {
-    if (lum > 215)
+    /* на белом фоне почти-белые делаем чёрными */
+    if (mn > 232)
       return RGB(0, 0, 0);
   }
   return c;

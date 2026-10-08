@@ -139,7 +139,6 @@ static void ctx_fit(ViewCtx *v)
     v->fit_scale = fabs(xf.a);
   }
   apply_view_flips(v);
-  v->need_fit = 0;
   InvalidateRect(v->hWnd, NULL, FALSE);
 }
 
@@ -211,6 +210,7 @@ static void update_scrollbars(ViewCtx *v)
 
 static void scroll_horizontal(ViewCtx *v, int wparam)
 {
+  v->need_fit = 0;
   SCROLLINFO si;
   memset(&si, 0, sizeof(si));
   si.cbSize = sizeof(si);
@@ -251,6 +251,7 @@ static void scroll_horizontal(ViewCtx *v, int wparam)
 
 static void scroll_vertical(ViewCtx *v, int wparam)
 {
+  v->need_fit = 0;
   SCROLLINFO si;
   memset(&si, 0, sizeof(si));
   si.cbSize = sizeof(si);
@@ -302,6 +303,7 @@ static void zoom_at(ViewCtx *v, int mx, int my, double factor)
   if (newz < minz || newz > maxz)
     return;
   double k = newz / cur;
+  v->need_fit = 0; /* пользователь изменил масштаб — больше не авто-подгонка */
   /* точка модели под курсором остаётся на месте; масштабируем ОБЕ оси,
      сохраняя их знаки (знак d задаёт вертикальную ориентацию). */
   if (v->view.a != 0.0) {
@@ -455,6 +457,7 @@ static LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wParam,
     if (v && v->dragging) {
       int x = (short)LOWORD(lParam);
       int y = (short)HIWORD(lParam);
+      v->need_fit = 0;
       v->view.e += (double)(x - v->prev_x);
       v->view.f += (double)(y - v->prev_y);
       v->prev_x = x;
@@ -496,6 +499,8 @@ static LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wParam,
         break;
       case VK_HOME:
       case 'F':
+      case VK_NUMPAD5:
+        v->need_fit = 1; /* вернуться к «по габаритам» */
         ctx_fit(v);
         break;
       case 'V': /* зеркало по вертикали */
@@ -724,6 +729,7 @@ int __stdcall ListSendCommandW(HWND listWin, int command, int parameter)
     /* pan vertically to a fraction of the content */
     if (!v->model || !v->model->has_content)
       return LISTPLUGIN_ERROR;
+    v->need_fit = 0;
     int pct = parameter;
     if (pct < 0)
       pct = 0;

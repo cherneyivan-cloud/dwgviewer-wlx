@@ -215,27 +215,33 @@ static wchar_t *finish_text_w(const wchar_t *in)
   int n = 0, i = 0;
   while (in[i] && n < 4090) {
     wchar_t c = in[i];
-    if (c == L'{') {
-      int depth = 1;
+    /* фигурные скобки MTEXT задают формат группы — сами скобки убираем,
+       а текст внутри СОХРАНЯЕМ */
+    if (c == L'{' || c == L'}') {
       i++;
-      while (in[i] && depth > 0) {
-        if (in[i] == L'{')
-          depth++;
-        else if (in[i] == L'}')
-          depth--;
-        i++;
-      }
       continue;
     }
-    if (c == L'\\' && in[i + 1] == L'P') { tmp[n++] = L'\n'; i += 2; continue; }
-    if (c == L'\\' && in[i + 1] == L'\\') { tmp[n++] = L'\\'; i += 2; continue; }
-    if (c == L'\\' && (in[i + 1] == L'L' || in[i + 1] == L'l' ||
-                       in[i + 1] == L'O' || in[i + 1] == L'o' ||
-                       in[i + 1] == L'K' || in[i + 1] == L'k' ||
-                       in[i + 1] == L'S' || in[i + 1] == L'H' ||
-                       in[i + 1] == L'F' || in[i + 1] == L'A' ||
-                       in[i + 1] == L'C' || in[i + 1] == L'T' ||
-                       in[i + 1] == L'W' || in[i + 1] == L'Z')) {
+    if (c == L'\\') {
+      wchar_t nx = in[i + 1];
+      if (nx == L'P') { tmp[n++] = L'\n'; i += 2; continue; }
+      if (nx == L'~') { tmp[n++] = L' '; i += 2; continue; }
+      if (nx == L'\\') { tmp[n++] = L'\\'; i += 2; continue; }
+      if (nx == L'{') { tmp[n++] = L'{'; i += 2; continue; }
+      if (nx == L'}') { tmp[n++] = L'}'; i += 2; continue; }
+      /* коды с параметрами (до ';'): \A1; \C1; \fArial|...; \H..; \W..; \S..; \Q..; \T..; \p.. */
+      if (nx == L'A' || nx == L'a' || nx == L'C' || nx == L'c' ||
+          nx == L'F' || nx == L'f' || nx == L'H' || nx == L'h' ||
+          nx == L'Q' || nx == L'q' || nx == L'S' || nx == L's' ||
+          nx == L'T' || nx == L't' || nx == L'W' || nx == L'w' ||
+          nx == L'p') {
+        i += 2;
+        while (in[i] && in[i] != L';')
+          i++;
+        if (in[i] == L';')
+          i++;
+        continue;
+      }
+      /* прочие переключатели (\L \O \K \N \X...) — без параметров */
       i += 2;
       continue;
     }
@@ -314,87 +320,49 @@ static wchar_t *make_text_w(const char *utf8)
     }
   }
   int utf8_ok = is_valid_utf8((const unsigned char *)utf8);
-  /* first pass: decode %% codes and produce wchar lines */
-  wchar_t tmp[4096];
+  /* декодируем (UTF-8 либо CP1251) в широкую строку, а MTEXT-коды
+     обрабатываем единообразно в finish_text_w() */
+  wchar_t wbuf[4096];
   int n = 0;
   const unsigned char *s = (const unsigned char *)utf8;
   while (*s && n < 4090) {
-    if (*s == '{') { /* MTEXT formatting group: skip until matching } */
-      int depth = 1;
-      s++;
-      while (*s && depth > 0) {
-        if (*s == '{')
-          depth++;
-        else if (*s == '}')
-          depth--;
-        s++;
-      }
-      continue;
-    }
-    if (*s == '\\' && s[1] == 'P') { tmp[n++] = L'\n'; s += 2; continue; }
-    if (*s == '\\' && (s[1] == '\\')) { tmp[n++] = L'\\'; s += 2; continue; }
-    if (*s == '\\' && (s[1] == 'L' || s[1] == 'l' || s[1] == 'O' ||
-                       s[1] == 'o' || s[1] == 'K' || s[1] == 'k' ||
-                       s[1] == 'S' || s[1] == 'H' || s[1] == 'F' ||
-                       s[1] == 'A' || s[1] == 'C' || s[1] == 'T' ||
-                       s[1] == 'W' || s[1] == 'Z')) {
-      s += 2;
-      continue;
-    }
-    if (*s == '%' && s[1] == '%' && s[2]) {
-      if (s[2] == 'c') { tmp[n++] = 0x2300 /* diameter */; s += 3; continue; }
-      if (s[2] == 'd') { tmp[n++] = 0x00B0 /* degree */;  s += 3; continue; }
-      if (s[2] == 'p') { tmp[n++] = 0x00B1 /* plusminus */; s += 3; continue; }
-      if (s[2] == '%') { tmp[n++] = L'%'; s += 3; continue; }
-      /* unknown %% keep literal */
-    }
-    /* plain sequence: decode one character */
     if (*s < 0x80) {
-      tmp[n++] = (wchar_t)*s;
+      wbuf[n++] = (wchar_t)*s;
       s++;
     } else if (utf8_ok && (*s & 0xE0) == 0xC0 && s[1] &&
                (s[1] & 0xC0) == 0x80) {
-      wchar_t c = (wchar_t)(((*s & 0x1F) << 6) | (s[1] & 0x3F));
-      tmp[n++] = c;
+      wbuf[n++] = (wchar_t)(((*s & 0x1F) << 6) | (s[1] & 0x3F));
       s += 2;
     } else if (utf8_ok && (*s & 0xF0) == 0xE0 && s[1] && s[2] &&
                (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80) {
-      wchar_t c = (wchar_t)(((*s & 0x0F) << 12) | ((s[1] & 0x3F) << 6) |
+      wbuf[n++] = (wchar_t)(((*s & 0x0F) << 12) | ((s[1] & 0x3F) << 6) |
                             (s[2] & 0x3F));
-      tmp[n++] = c;
       s += 3;
     } else if (utf8_ok && (*s & 0xF8) == 0xF0 && s[1] && s[2] && s[3] &&
                (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80 &&
                (s[3] & 0xC0) == 0x80) {
       wchar_t c = (wchar_t)((((*s & 0x07) << 18) | ((s[1] & 0x3F) << 12) |
                             ((s[2] & 0x3F) << 6) | (s[3] & 0x3F)) - 0x10000);
-      if (c < 0xD800 || c >= 0xDC00) /* surrogate pair, keep low surrogate */
-        tmp[n++] = c + 0xDC00;
+      if (c < 0xD800 || c >= 0xDC00)
+        wbuf[n++] = c + 0xDC00;
       s += 4;
     } else {
-      /* Windows-1251 (CP1251) fallback for Russian texts:
-         кириллица (А..Я а..я) и Ё/ё */
       unsigned char b = *s;
       if (b == 0xA8)
-        tmp[n++] = 0x0401; /* Ё */
+        wbuf[n++] = 0x0401;
       else if (b == 0xB8)
-        tmp[n++] = 0x0451; /* ё */
+        wbuf[n++] = 0x0451;
       else if (b >= 0xC0 && b <= 0xDF)
-        tmp[n++] = (wchar_t)(0x0410 + (b - 0xC0)); /* А..Я */
+        wbuf[n++] = (wchar_t)(0x0410 + (b - 0xC0));
       else if (b >= 0xE0 && b <= 0xFF)
-        tmp[n++] = (wchar_t)(0x0430 + (b - 0xE0)); /* а..я */
+        wbuf[n++] = (wchar_t)(0x0430 + (b - 0xE0));
       else
-        tmp[n++] = (wchar_t)b;
+        wbuf[n++] = (wchar_t)b;
       s++;
     }
   }
-  tmp[n] = 0;
-  if (n == 0)
-    return NULL;
-  wchar_t *out = (wchar_t *)malloc(((size_t)n + 1) * sizeof(wchar_t));
-  if (out)
-    wcscpy(out, tmp);
-  return out;
+  wbuf[n] = 0;
+  return finish_text_w(wbuf);
 }
 
 static void emit_text(MBlock *b, MPt pos, double height, double rot,
