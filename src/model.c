@@ -67,6 +67,18 @@ static COLORREF color_from_rgb(DWORD rgb)
   return RGB(r, g, b);
 }
 
+/* COLORREF из Dwg_Color с запасным значением (для ByBlock/ByLayer). */
+static COLORREF cmc_color(Dwg_Color *c, COLORREF fallback)
+{
+  if (!c)
+    return fallback;
+  if (c->method == DWG_COLOR_METHOD_TRUECOLOR && c->rgb)
+    return color_from_rgb(c->rgb);
+  if (c->index >= 1 && c->index <= 255)
+    return aci_color(c->index);
+  return fallback;
+}
+
 static COLORREF layer_color(Dwg_Data *dwg, Dwg_Object_Ref *lref)
 {
   if (!lref)
@@ -868,22 +880,93 @@ static void entity_leader(MBlock *b, Dwg_Entity_LEADER *e, COLORREF color,
   free(pts);
 }
 
-static void entity_dimension(MBlock *b, Dwg_Data *dwg, Dwg_DIMENSION_common *d,
-                             COLORREF color)
+static void handle_insert(MBlock *b, const Dwg_Entity_INSERT *ins,
+                          Dwg_Data *dwg, DwgModel *m);
+
+static void entity_dimension(MBlock *b, Dwg_Data *dwg, DwgModel *m,
+                             Dwg_DIMENSION_common *d, COLORREF color)
 {
-  (void)dwg;
   if (!d)
     return;
-  /* draw a simple representation: dimension line between definition points
-     and the dimension text at its middle point. */
-  MPt p1 = {d->def_pt.x, d->def_pt.y};
-  MPt p2 = {d->text_midpt.x, d->text_midpt.y};
+  /* Размеры хранят всю графику (линии, стрелки, текст) в связанном
+     анонимном блоке — разворачиваем его как вставку в начале координат. */
+  if (d->block) {
+    Dwg_Entity_INSERT tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.block_header = d->block;
+    tmp.scale.x = tmp.scale.y = tmp.scale.z = 1.0;
+    handle_insert(b, &tmp, dwg, m);
+    return;
+  }
+  /* Запасной вариант (нет блока): линия определений + текст. */
+  MPt p1 = { d->def_pt.x, d->def_pt.y };
+  MPt p2 = { d->text_midpt.x, d->text_midpt.y };
   emit_line(b, p1.x, p1.y, p2.x, p2.y, color, DPS_SOLID);
   if (d->user_text) {
-    /* crude default height: 1/50 of dimension length */
     double len = hypot(p2.x - p1.x, p2.y - p1.y);
     double h = len > 0 ? len / 50.0 : 1e-3;
     emit_text(b, p2, h, d->text_rotation, d->user_text, color);
+  }
+}
+
+/* Мультивыноска (MULTILEADER): линии выносок + содержимое (текст или блок). */
+static void entity_multileader(MBlock *b, Dwg_Data *dwg, DwgModel *m,
+                               Dwg_Entity_MULTILEADER *ml, COLORREF color,
+                               int pen)
+{
+  if (!ml)
+    return;
+  Dwg_MLEADER_AnnotContext *ctx = &ml->ctx;
+  /* линии выносок */
+  unsigned long nl = ctx->num_leaders;
+  if (ctx->leaders && nl) {
+    if (nl > 1000)
+      nl = 1000;
+    for (unsigned long i = 0; i < nl; i++) {
+      Dwg_LEADER_Node *nd = &ctx->leaders[i];
+      unsigned long nlines = nd->num_lines;
+      if (!nd->lines || !nlines)
+        continue;
+      if (nlines > 64)
+        nlines = 64;
+      for (unsigned long j = 0; j < nlines; j++) {
+        Dwg_LEADER_Line *ln = &nd->lines[j];
+        unsigned long np = ln->num_points;
+        if (!ln->points || np < 2)
+          continue;
+        if (np > 1000)
+          np = 1000;
+        MPt *pts = (MPt *)malloc((size_t)np * sizeof(MPt));
+        if (!pts)
+          continue;
+        for (unsigned long k = 0; k < np; k++) {
+          pts[k].x = ln->points[k].x;
+          pts[k].y = ln->points[k].y;
+        }
+        emit_polygon(b, pts, (int)np, color, pen, 0);
+        free(pts);
+      }
+    }
+  }
+  /* содержимое: текст или блок */
+  if (ctx->has_content_txt) {
+    Dwg_MLEADER_Content_MText *t = &ctx->content.txt;
+    double h = (t->height > 0) ? t->height : ctx->text_height;
+    MPt pos = { t->location.x, t->location.y };
+    emit_text(b, pos, h, t->rotation, t->default_text,
+              cmc_color(&t->color, color));
+  } else if (ctx->has_content_blk) {
+    Dwg_MLEADER_Content_Block *blk = &ctx->content.blk;
+    Dwg_Entity_INSERT tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.block_header = blk->block_table;
+    tmp.ins_pt.x = blk->location.x;
+    tmp.ins_pt.y = blk->location.y;
+    tmp.rotation = blk->rotation;
+    tmp.scale.x = (blk->scale.x != 0) ? blk->scale.x : 1.0;
+    tmp.scale.y = (blk->scale.y != 0) ? blk->scale.y : 1.0;
+    tmp.scale.z = (blk->scale.z != 0) ? blk->scale.z : 1.0;
+    handle_insert(b, &tmp, dwg, m);
   }
 }
 
@@ -1375,7 +1458,18 @@ static void build_canvas(BuildCtx *ctx, Dwg_Object *base, int is_block)
       }
       case DWG_TYPE_DIMENSION_LINEAR:
       case DWG_TYPE_DIMENSION_ALIGNED:
-        entity_dimension(b, ctx->dwg, ent->tio.DIMENSION_common, color);
+      case DWG_TYPE_DIMENSION_ANG2LN:
+      case DWG_TYPE_DIMENSION_ANG3PT:
+      case DWG_TYPE_DIMENSION_DIAMETER:
+      case DWG_TYPE_DIMENSION_RADIUS:
+      case DWG_TYPE_DIMENSION_ORDINATE:
+        if (ent->tio.DIMENSION_common)
+          entity_dimension(b, ctx->dwg, ctx->m, ent->tio.DIMENSION_common,
+                           color);
+        break;
+      case DWG_TYPE_MULTILEADER:
+        entity_multileader(b, ctx->dwg, ctx->m, ent->tio.MULTILEADER, color,
+                           pen);
         break;
       case DWG_TYPE_ATTRIB: {
         Dwg_Entity_ATTRIB *at = ent->tio.ATTRIB;
