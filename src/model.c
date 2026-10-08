@@ -1219,7 +1219,7 @@ static MPt *hatch_loop_pts(Dwg_HATCH_Path *path, int *out_n)
     for (unsigned long i = 0; i < ns && n < cap; i++) {
       Dwg_HATCH_PathSeg *s = &sg[i];
       if (s->curve_type == 1) { /* линия */
-        if (!have) {
+        if (n < cap) {
           pt[n].x = s->first_endpoint.x;
           pt[n].y = s->first_endpoint.y;
           n++;
@@ -1234,7 +1234,7 @@ static MPt *hatch_loop_pts(Dwg_HATCH_Path *path, int *out_n)
                               s->start_angle);
         double sgn = hatch_pick_sign(p1, p2, last, have, s->is_ccw);
         int m = hatch_arc_add(s->center.x, s->center.y, s->radius,
-                              s->start_angle, s->end_angle, sgn, have ? 1 : 0,
+                              s->start_angle, s->end_angle, sgn, 0,
                               pt + n, cap - n);
         n += m;
         if (m > 0 && n > 0) { last = pt[n - 1]; have = 1; }
@@ -1247,7 +1247,7 @@ static MPt *hatch_loop_pts(Dwg_HATCH_Path *path, int *out_n)
                               s->start_angle);
         double sgn = hatch_pick_sign(p1, p2, last, have, s->is_ccw);
         int m = hatch_ell_add(cxx, cyy, ex, ey, s->minor_major_ratio,
-                              s->start_angle, s->end_angle, sgn, have ? 1 : 0,
+                              s->start_angle, s->end_angle, sgn, 0,
                               pt + n, cap - n);
         n += m;
         if (m > 0 && n > 0) { last = pt[n - 1]; have = 1; }
