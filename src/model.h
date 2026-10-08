@@ -38,6 +38,7 @@ typedef struct {
   double rot;        /* radians */
   double wrap_width; /* KP_TEXT: ширина рамки в ед. модели (0 = без переноса) */
   int attach;        /* KP_TEXT: MTEXT attachment 1..9 (0 = baseline, left) */
+  double linespace;  /* KP_TEXT: MTEXT linespace_factor (1.0 = по умолчанию) */
   wchar_t *text;     /* may contain '\n' line breaks */
 } KPrim;
 

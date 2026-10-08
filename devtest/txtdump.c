@@ -1,45 +1,10 @@
-/* txtdump.c - dump TEXT/MTEXT decoded (UTF-16LE aware) */
+/* txtdump.c - MTEXT linespace / rotation probe */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <wchar.h>
+#include <math.h>
 #include "dwgload.h"
 #include <dwg.h>
-
-static int looks_utf16(const unsigned char *s, int maxn)
-{
-  int hi = 0, lo = 0;
-  for (int i = 0; i < maxn; i += 2) {
-    if (!s[i] && !s[i + 1]) break;
-    if (s[i + 1] == 0) lo++;
-    else hi++;
-  }
-  return lo > hi && lo > 0;
-}
-
-static void print_str(const char *s)
-{
-  if (!s) { printf("(null)\n"); return; }
-  const unsigned char *b = (const unsigned char *)s;
-  if (looks_utf16(b, 400)) {
-    printf("UTF16: \"");
-    for (int i = 0; b[i] || b[i + 1]; i += 2) {
-      unsigned int c = b[i] | (b[i + 1] << 8);
-      if (c >= 32 && c < 127) putchar(c);
-      else if (c == 10) printf("\\n");
-      else if (c == 13) ;
-      else printf("[%04X]", c);
-    }
-    printf("\"\n");
-  } else {
-    printf("BYTES: \"");
-    for (int i = 0; b[i] && i < 400; i++) {
-      unsigned char c = b[i];
-      putchar((c >= 32 && c < 127) ? c : '.');
-    }
-    printf("\"\n");
-  }
-}
 
 int main(int argc, char **argv)
 {
@@ -47,20 +12,35 @@ int main(int argc, char **argv)
   Dwg_Data dwg; memset(&dwg, 0, sizeof(dwg));
   int err = dwg_read_file(argv[1], &dwg);
   printf("read ret=%d objects=%u\n", err, dwg.num_objects);
-  int nt = 0, nm = 0;
+  int n = 0;
+  int hist_f[64]; memset(hist_f, 0, sizeof(hist_f));
+  int hist_s[16]; memset(hist_s, 0, sizeof(hist_s));
+  int rot_nonzero = 0;
   for (unsigned int i = 0; i < dwg.num_objects; i++) {
     Dwg_Object *o = &dwg.object[i];
     if (o->supertype != DWG_SUPERTYPE_ENTITY || !o->tio.entity) continue;
     Dwg_Object_Entity *e = o->tio.entity;
-    if (o->fixedtype == DWG_TYPE_TEXT && e->tio.TEXT) {
-      Dwg_Entity_TEXT *t = e->tio.TEXT;
-      if (nt++ < 10) { printf("[TEXT] "); print_str(t->text_value); }
-    } else if (o->fixedtype == DWG_TYPE_MTEXT && e->tio.MTEXT) {
+    if (o->fixedtype == DWG_TYPE_MTEXT && e->tio.MTEXT) {
       Dwg_Entity_MTEXT *t = e->tio.MTEXT;
-      if (nm < 25) { printf("[MTEXT] "); print_str(t->text); nm++; }
+      double ang = atan2(t->x_axis_dir.y, t->x_axis_dir.x) * 180.0 / M_PI;
+      if (fabs(ang) > 0.5) rot_nonzero++;
+      int f = (int)(t->linespace_factor * 20.0 + 0.5);
+      if (f >= 0 && f < 64) hist_f[f]++;
+      int s = t->linespace_style;
+      if (s >= 0 && s < 16) hist_s[s]++;
+      if (n < 12)
+        printf("[MTEXT] style=%d factor=%g style731=%d rot=%.1f attr=%d w=%.1f h=%.1f\n",
+               t->linespace_style, t->linespace_factor, t->linespace_style, ang,
+               t->attachment, t->rect_width, t->text_height);
+      n++;
     }
   }
-  printf("counts TEXT=%d MTEXT(shown)=%d\n", nt, nm);
+  printf("MTEXT total=%d nonzero_rot=%d\n", n, rot_nonzero);
+  printf("factor histogram (x20):");
+  for (int i = 0; i < 64; i++) if (hist_f[i]) printf(" %.2f->%d", i/20.0, hist_f[i]);
+  printf("\nstyle histogram:");
+  for (int i = 0; i < 16; i++) if (hist_s[i]) printf(" %d->%d", i, hist_s[i]);
+  printf("\n");
   dwg_free(&dwg);
   return 0;
 }

@@ -232,9 +232,25 @@ static void draw_text_prim(HDC hdc, KPrim *p, const XForm *xf,
   double ux, uy, vx, vy;
   xf_apply(xf, 1.0, 0.0, &ux, &uy);
   xf_apply(xf, 0.0, 1.0, &vx, &vy);
-  double dirx = ux - ax, diry = uy - ay;
-  double upx = vx - ax, upy = vy - ay;
+  double dirx = ux - ax, diry = uy - ay; /* ось X модели в экране */
+  double upx = vx - ax, upy = vy - ay;   /* ось Y модели в экране */
   double hpx = hypot(upx, upy) * p->height;
+  /* направление базовой линии текста с учётом поворота p->rot */
+  double cb = cos(p->rot), sb = sin(p->rot);
+  double bx2, by2, dx2, dy2;
+  xf_apply(xf, cb, sb, &bx2, &by2);
+  double bdx = bx2 - ax, bdy = by2 - ay;
+  double blen = hypot(bdx, bdy);
+  if (blen < 1e-12) { bdx = dirx; bdy = diry; blen = hypot(bdx, bdy); }
+  if (blen < 1e-12) { bdx = 1; bdy = 0; blen = 1; }
+  double ubx = bdx / blen, uby = bdy / blen; /* единичный вектор по строке */
+  /* направление "вниз" строки (перпендикуляр к базовой линии) */
+  double dnx = sb, dny = -cb;
+  xf_apply(xf, dnx, dny, &dx2, &dy2);
+  double ddx = dx2 - ax, ddy = dy2 - ay;
+  double dlen = hypot(ddx, ddy);
+  if (dlen < 1e-12) { ddx = 0; ddy = 1; dlen = 1; }
+  double udx = ddx / dlen, udy = ddy / dlen; /* единичный вектор вниз */
   /* Минимальный читаемый размер шрифта.  На чертежах с большим охватом
      (например, 10^6..10^7 единиц) реальная высота текста в пикселях при
      подгонке под окно оказывается < 1 px, и тайтлы пропадают.  Прижимаем
@@ -243,7 +259,7 @@ static void draw_text_prim(HDC hdc, KPrim *p, const XForm *xf,
     hpx = 8.0;
   if (hpx > 3000)
     hpx = 3000;
-  int esc = (int)floor(atan2(diry, dirx) * (180.0 / M_PI) * 10.0 + 0.5);
+  int esc = (int)floor(atan2(bdy, bdx) * (180.0 / M_PI) * 10.0 + 0.5);
   HFONT font = text_font(fc, (int)(hpx + 0.5), esc);
   HFONT old = (HFONT)SelectObject(hdc, font);
   int oldta = SetTextAlign(hdc, TA_LEFT | TA_BASELINE | TA_NOUPDATECP);
@@ -325,10 +341,13 @@ static void draw_text_prim(HDC hdc, KPrim *p, const XForm *xf,
     return;
   }
 
-  double lsp = hpx * 1.33;
+  /* Интерлиньяж MTEXT: базовый = 5/3·высоты (значение DWG «3-on-5»),
+     домножается на linespace_factor (DXF 44). */
+  double lsf = (p->linespace > 0.25 && p->linespace < 4.0) ? p->linespace : 1.0;
+  double lsp = hpx * (5.0 / 3.0) * lsf;
   int at = p->attach;
-  double base0 = py0; /* TEXT: базовая линия в точке вставки, влево */
   int ha = 0;
+  double bx0 = px0, by0 = py0; /* базовая точка строки 0 (слева) */
   if (at >= 1 && at <= 9) {
     int va = (at - 1) / 3; /* 0 top, 1 middle, 2 bottom */
     ha = (at - 1) % 3;     /* 0 left, 1 center, 2 right */
@@ -338,28 +357,29 @@ static void draw_text_prim(HDC hdc, KPrim *p, const XForm *xf,
       asc = tm.tmAscent;
       desc = tm.tmDescent;
     }
-    double blockH = (double)(nlines - 1) * lsp + asc + desc;
+    double off; /* смещение базовой линии строки 0 вдоль «вниз» */
     if (va == 0)
-      base0 = py0 + asc;                                     /* top */
+      off = asc;                                                    /* top */
     else if (va == 1)
-      base0 = py0 - blockH / 2.0 + asc;                      /* middle */
+      off = -((double)(nlines - 1) * lsp + desc - asc) / 2.0;       /* middle */
     else
-      base0 = py0 - (double)(nlines - 1) * lsp - desc;       /* bottom */
+      off = -((double)(nlines - 1) * lsp + desc);                   /* bottom */
+    bx0 = px0 + udx * off;
+    by0 = py0 + udy * off;
   }
 
   for (int li = 0; li < nlines; li++) {
-    double x = px0;
+    double off = 0.0;
     if (ha == 1 || ha == 2) {
       SIZE sz;
       GetTextExtentPoint32W(hdc, line_p[li], line_l[li], &sz);
-      if (ha == 1)
-        x = px0 - sz.cx / 2.0;
-      else
-        x = px0 - (double)sz.cx;
+      off = (ha == 1) ? sz.cx / 2.0 : (double)sz.cx;
     }
+    double lx = bx0 + udx * ((double)li * lsp) - ubx * off;
+    double ly = by0 + udy * ((double)li * lsp) - uby * off;
     if (line_l[li] > 0)
-      TextOutW(hdc, (int)(x + 0.5), (int)(base0 + li * lsp + 0.5),
-               line_p[li], line_l[li]);
+      TextOutW(hdc, (int)(lx + 0.5), (int)(ly + 0.5), line_p[li],
+               line_l[li]);
   }
   SetTextAlign(hdc, oldta);
   SelectObject(hdc, old);
