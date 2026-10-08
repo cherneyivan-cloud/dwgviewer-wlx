@@ -259,7 +259,10 @@ static void draw_text_prim(HDC hdc, KPrim *p, const XForm *xf,
     hpx = 8.0;
   if (hpx > 3000)
     hpx = 3000;
-  int esc = (int)floor(atan2(bdy, bdx) * (180.0 / M_PI) * 10.0 + 0.5);
+  /* GDI-угол (escapement) отсчитывается против часовой в системе с осью Y
+     вверх, а наши экранные координаты — с Y вниз, поэтому знак Y инвертируем:
+     иначе повёрнутый текст выходит развёрнутым на 180°. */
+  int esc = (int)floor(atan2(-bdy, bdx) * (180.0 / M_PI) * 10.0 + 0.5);
   HFONT font = text_font(fc, (int)(hpx + 0.5), esc);
   HFONT old = (HFONT)SelectObject(hdc, font);
   int oldta = SetTextAlign(hdc, TA_LEFT | TA_BASELINE | TA_NOUPDATECP);
