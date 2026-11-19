@@ -47,7 +47,12 @@ jobs:
       - name: Package binaries
         run: |
           cd dist
+          copy ..\install.bat . >nul
+          copy ..\install.ps1 . >nul
+          copy ..\INSTALL.md . >nul
           powershell -Command "tar -a -c -f DwgViewer-win64.zip dwgviewer.wlx libredwg-0.dll README.md LICENSE install.bat install.ps1 INSTALL.md"
+          dir
+        shell: cmd
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
