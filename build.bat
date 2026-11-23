@@ -26,6 +26,7 @@ if not exist "%OBJ%" mkdir "%OBJ%"
 if not exist "%DIST%" mkdir "%DIST%"
 
 set "CCOPTS=-O2 -Wall -m64 -D_WIN32_WINNT=0x0601"
+if "%PROFILE%"=="1" set "CCOPTS=%CCOPTS% -DPROFILE_ENABLED"
 set "INC=-I "%LR%\include" -I "%SRC%""
 
 echo [1/6] aci.c

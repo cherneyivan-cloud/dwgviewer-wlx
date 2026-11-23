@@ -10,6 +10,15 @@
 #include "draw.h"
 #include "model.h"
 
+#ifdef PROFILE_ENABLED
+static unsigned long d_strokes, d_fills, d_texts, d_points, d_culled,
+    d_subpx, d_batches, d_text_drawn, d_text_small, d_text_cull;
+static double d_text_hmin = 1e9, d_text_hmax = 0;
+#define DINC(v) ((v)++)
+#else
+#define DINC(v) do {} while (0)
+#endif
+
 /* ------------------------------------------------------------------ */
 /* XForm                                                               */
 
@@ -158,6 +167,7 @@ static HBRUSH get_brush(PenEnt *cache, DWORD key)
 typedef struct {
   int h;
   int esc;
+  int w; /* lfWidth: negative = requested average character width */
   HFONT font;
 } TextFontEnt;
 
@@ -172,28 +182,44 @@ static void text_font_clear(TextFontEnt *c)
   }
 }
 
-static HFONT text_font(TextFontEnt *c, int h, int esc)
+/* Creates a font for the given pixel height, escapement (1/10 degree) and
+   width factor. GDI's lfWidth condenses the glyph outlines themselves, so a
+   DWG width factor (DXF 41) is reproduced without a world transform - the
+   latter distorts text at small sizes and does not combine well with the
+   font escapement used for rotated text. The 0.448 factor was calibrated
+   against measured ink widths (lfWidth = -0.448*h gives the natural width
+   of Arial; smaller values compress proportionally). */
+static HFONT text_font(TextFontEnt *c, int h, int esc, double wf)
 {
   if (h < 2)
     h = 2;
   if (h > 3000)
     h = 3000;
+  if (!(wf > 0.02) || wf > 10.0)
+    wf = 1.0;
+  int lw = -(int)((double)h * 0.448 * wf + 0.5);
+  if (lw > -1)
+    lw = -1;
   while (esc < 0)
     esc += 3600;
   esc %= 3600;
   for (int i = 0; i < TEXT_FONT_CACHE; i++) {
-    if (c[i].font && c[i].h == h && c[i].esc == esc)
+    if (c[i].font && c[i].h == h && c[i].esc == esc && c[i].w == lw)
       return c[i].font;
   }
-  TextFontEnt *e = &c[0];
+  /* round-robin replacement: a single slot would thrash the cache because
+     text height, escapement and width factor vary between entities */
+  static int rr = 0;
+  TextFontEnt *e = &c[rr++ % TEXT_FONT_CACHE];
   if (e->font)
     DeleteObject(e->font);
-  e->font = CreateFontW(-h, 0, esc, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+  e->font = CreateFontW(-h, lw, esc, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                         DEFAULT_CHARSET, OUT_TT_ONLY_PRECIS,
                         CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                         DEFAULT_PITCH | FF_DONTCARE, L"Arial");
   e->h = h;
   e->esc = esc;
+  e->w = lw;
   return e->font;
 }
 
@@ -219,9 +245,40 @@ static COLORREF adjust_color(COLORREF c, int bg_white)
 }
 
 /* starts/ends: indices into text string per line */
+
+/* When the drawing contains many text entities (large maps/plans), drawing
+   every label at the 8 px readability floor turns the overview into an
+   unreadable smear and dominates paint time. In that case labels are drawn
+   only at their true size and skipped when below ~3 px; zooming in brings
+   them back. Small drawings keep the old "always readable" floor. */
+static double g_text_min_px = 4.0;
+static int g_text_cull_margin = 1024;
+/* Multiplier on top of the DWG width factor (1.0 = exactly as in the file).
+   Some fonts substitute differently from AutoCAD's SHX fonts; this lets the
+   user soften or strengthen the condensation without a rebuild. */
+static double g_text_wf_scale = 1.0;
+
+void draw_set_text_min_px(double px)
+{
+  if (px < 0.0)
+    px = 0.0;
+  if (px > 64.0)
+    px = 64.0;
+  g_text_min_px = px;
+}
+
+void draw_set_text_width_scale(double scale)
+{
+  if (!(scale > 0.2))
+    scale = 1.0;
+  if (scale > 3.0)
+    scale = 3.0;
+  g_text_wf_scale = scale;
+}
+
 static void draw_text_prim(HDC hdc, KPrim *p, const XForm *xf,
                            PenEnt *pc, TextFontEnt *fc, int draw_text,
-                           int bg_white)
+                           int bg_white, int cw, int ch)
 {
   (void)pc;
   if (!draw_text || !p->text || !p->text[0])
@@ -251,19 +308,42 @@ static void draw_text_prim(HDC hdc, KPrim *p, const XForm *xf,
   double dlen = hypot(ddx, ddy);
   if (dlen < 1e-12) { ddx = 0; ddy = 1; dlen = 1; }
   double udx = ddx / dlen, udy = ddy / dlen; /* единичный вектор вниз */
-  /* Минимальный читаемый размер шрифта.  На чертежах с большим охватом
-     (например, 10^6..10^7 единиц) реальная высота текста в пикселях при
-     подгонке под окно оказывается < 1 px, и тайтлы пропадают.  Прижимаем
-     снизу, чтобы подписи всегда были читаемы (как у карт/навигаторов). */
-  if (hpx < 8.0)
-    hpx = 8.0;
+  /* Text is never enlarged beyond its true size: it appears when it becomes
+     big enough to read at the current zoom, so at the overview it cannot
+     cover the geometry. g_text_min_px is the smallest size we bother with. */
+  if (hpx < g_text_min_px) {
+    DINC(d_text_small);
+    return;
+  }
   if (hpx > 3000)
     hpx = 3000;
+#ifdef PROFILE_ENABLED
+  DINC(d_text_drawn);
+  if (hpx < d_text_hmin)
+    d_text_hmin = hpx;
+  if (hpx > d_text_hmax)
+    d_text_hmax = hpx;
+#endif
   /* GDI-угол (escapement) отсчитывается против часовой в системе с осью Y
      вверх, а наши экранные координаты — с Y вниз, поэтому знак Y инвертируем:
      иначе повёрнутый текст выходит развёрнутым на 180°. */
   int esc = (int)floor(atan2(-bdy, bdx) * (180.0 / M_PI) * 10.0 + 0.5);
-  HFONT font = text_font(fc, (int)(hpx + 0.5), esc);
+  double wf = p->wf * g_text_wf_scale;
+  if (wf < 0.05)
+    wf = 0.05;
+  if (wf > 10.0)
+    wf = 10.0;
+
+  double px0, py0;
+  xf_apply(xf, p->pos.x, p->pos.y, &px0, &py0);
+  /* cheap viewport cull: skip labels whose anchor is far outside the window */
+  if (px0 < -g_text_cull_margin || px0 > cw + g_text_cull_margin ||
+      py0 < -g_text_cull_margin || py0 > ch + g_text_cull_margin) {
+    DINC(d_text_cull);
+    return;
+  }
+
+  HFONT font = text_font(fc, (int)(hpx + 0.5), esc, wf);
   HFONT old = (HFONT)SelectObject(hdc, font);
   int oldta = SetTextAlign(hdc, TA_LEFT | TA_BASELINE | TA_NOUPDATECP);
   SetBkMode(hdc, TRANSPARENT);
@@ -272,8 +352,6 @@ static void draw_text_prim(HDC hdc, KPrim *p, const XForm *xf,
   /* Разбиваем текст на строки (с переносом по ширине рамки), сохраняя ссылки
      внутрь p->text (перенос не вставляет символов). Затем выводим с учётом
      точки привязки MTEXT (attachment 1..9). */
-  double px0, py0;
-  xf_apply(xf, p->pos.x, p->pos.y, &px0, &py0);
   double wscale = hypot(dirx, diry);
   if (wscale < 1e-9)
     wscale = 1.0;
@@ -371,6 +449,12 @@ static void draw_text_prim(HDC hdc, KPrim *p, const XForm *xf,
     by0 = py0 + udy * off;
   }
 
+  /* Width factor (DXF 41). GDI has no per-font horizontal scale switch, so a
+     world transform on the DC scales the glyphs. When a width factor is
+     active the rotation is baked into that same transform and the font's
+     escapement is left at zero: combining escapement with a world transform
+     made GDI distort rotated glyphs (vertical table text fell apart). */
+  double line_off[1024];
   for (int li = 0; li < nlines; li++) {
     double off = 0.0;
     if (ha == 1 || ha == 2) {
@@ -378,8 +462,12 @@ static void draw_text_prim(HDC hdc, KPrim *p, const XForm *xf,
       GetTextExtentPoint32W(hdc, line_p[li], line_l[li], &sz);
       off = (ha == 1) ? sz.cx / 2.0 : (double)sz.cx;
     }
-    double lx = bx0 + udx * ((double)li * lsp) - ubx * off;
-    double ly = by0 + udy * ((double)li * lsp) - uby * off;
+    line_off[li] = off;
+  }
+
+  for (int li = 0; li < nlines; li++) {
+    double lx = bx0 + udx * ((double)li * lsp) - ubx * line_off[li];
+    double ly = by0 + udy * ((double)li * lsp) - uby * line_off[li];
     if (line_l[li] > 0)
       TextOutW(hdc, (int)(lx + 0.5), (int)(ly + 0.5), line_p[li],
                line_l[li]);
@@ -388,92 +476,190 @@ static void draw_text_prim(HDC hdc, KPrim *p, const XForm *xf,
   SelectObject(hdc, old);
 }
 
-/* convert a prim to device polyline points */
-static int prim_to_dev(KPrim *p, const XForm *xf, POINT *dev, int max)
+static int dev_in_range(double x, double y)
 {
+  /* GDI coordinates are ints; casting absurd values is UB and produces
+     random lines. Such primitives are always off-screen anyway. */
+  return isfinite(x) && isfinite(y) && fabs(x) < 1e9 && fabs(y) < 1e9;
+}
+
+/* transform points to device space once and report the device bbox */
+static int prim_to_dev_box(KPrim *p, const XForm *xf, POINT *dev, int max,
+                           int *minx, int *miny, int *maxx, int *maxy)
+{
+  int n = 0;
   if (p->kind == KP_POINT) {
     if (max < 1)
       return 0;
     double x, y;
     xf_apply(xf, p->p[0].x, p->p[0].y, &x, &y);
+    if (!dev_in_range(x, y))
+      return 0;
     dev[0].x = (int)(x + 0.5);
     dev[0].y = (int)(y + 0.5);
-    return 1;
-  }
-  if (p->kind != KP_POLY)
+    n = 1;
+  } else if (p->kind == KP_POLY) {
+    n = p->n > max ? max : p->n;
+    for (int i = 0; i < n; i++) {
+      double x, y;
+      xf_apply(xf, p->p[i].x, p->p[i].y, &x, &y);
+      if (!dev_in_range(x, y))
+        return 0;
+      dev[i].x = (int)(x + 0.5);
+      dev[i].y = (int)(y + 0.5);
+    }
+  } else {
     return 0;
-  int n = p->n > max ? max : p->n;
-  for (int i = 0; i < n; i++) {
-    double x, y;
-    xf_apply(xf, p->p[i].x, p->p[i].y, &x, &y);
-    dev[i].x = (int)(x + 0.5);
-    dev[i].y = (int)(y + 0.5);
   }
+  if (n < 1)
+    return 0;
+  int mnx = dev[0].x, mny = dev[0].y, mxx = dev[0].x, mxy = dev[0].y;
+  for (int i = 1; i < n; i++) {
+    if (dev[i].x < mnx) mnx = dev[i].x;
+    if (dev[i].x > mxx) mxx = dev[i].x;
+    if (dev[i].y < mny) mny = dev[i].y;
+    if (dev[i].y > mxy) mxy = dev[i].y;
+  }
+  *minx = mnx; *miny = mny; *maxx = mxx; *maxy = mxy;
   return n;
-}
-
-static int prim_visible(KPrim *p, const XForm *xf, int cw, int ch)
-{
-  int margin = 8;
-  double minx = 1e300, miny = 1e300, maxx = -1e300, maxy = -1e300;
-  int np = p->n;
-  if (p->kind == KP_POINT)
-    np = 1;
-  else if (p->kind != KP_POLY)
-    return 1;
-  for (int i = 0; i < np; i++) {
-    double x, y;
-    xf_apply(xf, p->p[i].x, p->p[i].y, &x, &y);
-    if (x < minx) minx = x;
-    if (x > maxx) maxx = x;
-    if (y < miny) miny = y;
-    if (y > maxy) maxy = y;
-  }
-  if (maxx < -margin || minx > cw + margin || maxy < -margin ||
-      miny > ch + margin)
-    return 0;
-  return 1;
 }
 
 /* ------------------------------------------------------------------ */
 /* main drawing                                                        */
 
+/* Stroke batching: consecutive polylines that share one GDI pen are
+   accumulated and submitted with a single PolyPolyline call. Draw order
+   is preserved exactly (a batch is flushed as soon as the pen changes),
+   so rendering is byte-identical to one Polyline per primitive, but GDI
+   call overhead drops dramatically on drawings with many entities. */
+
+typedef struct {
+  POINT *pts;
+  DWORD *cnt;
+  int n_poly, cap_poly;
+  int n_pt, cap_pt;
+  HPEN pen;
+} StrokeBatch;
+
+#define BATCH_MAX_PTS 262144
+
+static void batch_flush(HDC hdc, StrokeBatch *b)
+{
+  if (b->n_poly > 0) {
+    PolyPolyline(hdc, b->pts, b->cnt, (DWORD)b->n_poly);
+    DINC(d_batches);
+  }
+  b->n_poly = 0;
+  b->n_pt = 0;
+}
+
+static void batch_append(HDC hdc, StrokeBatch *b, const POINT *dev, int n)
+{
+  if (b->n_poly >= b->cap_poly) {
+    int nc = b->cap_poly ? b->cap_poly * 2 : 256;
+    DWORD *np = (DWORD *)realloc(b->cnt, (size_t)nc * sizeof(DWORD));
+    if (!np)
+      return;
+    b->cnt = np;
+    b->cap_poly = nc;
+  }
+  if (b->n_pt + n > b->cap_pt) {
+    int nc = b->cap_pt ? b->cap_pt * 2 : 8192;
+    while (nc < b->n_pt + n)
+      nc *= 2;
+    POINT *np = (POINT *)realloc(b->pts, (size_t)nc * sizeof(POINT));
+    if (!np)
+      return;
+    b->pts = np;
+    b->cap_pt = nc;
+  }
+  memcpy(&b->pts[b->n_pt], dev, (size_t)n * sizeof(POINT));
+  b->cnt[b->n_poly++] = (DWORD)n;
+  b->n_pt += n;
+  if (b->n_pt >= BATCH_MAX_PTS)
+    batch_flush(hdc, b);
+}
+
+static void batch_free(StrokeBatch *b)
+{
+  free(b->pts);
+  free(b->cnt);
+  memset(b, 0, sizeof(*b));
+}
+
 static void draw_block_rec(HDC hdc, DwgModel *m, int bi, const XForm *parent,
                            const DrawOpts *o, int depth, int cw, int ch,
-                           int draw_text, PenEnt *pc, TextFontEnt *fc);
+                           int draw_text, PenEnt *pc, TextFontEnt *fc,
+                           HPEN *cur_pen, HBRUSH *cur_brush,
+                           StrokeBatch *bat);
 
 static void draw_prim(HDC hdc, KPrim *p, const XForm *xf, const DrawOpts *o,
                       int cw, int ch, int draw_text, PenEnt *pc,
-                      TextFontEnt *fc)
+                      TextFontEnt *fc, HPEN *cur_pen, HBRUSH *cur_brush,
+                      StrokeBatch *bat)
 {
   if (p->kind == KP_TEXT) {
-    draw_text_prim(hdc, p, xf, pc, fc, draw_text, o->bg_white);
+    DINC(d_texts);
+    batch_flush(hdc, bat);
+    bat->pen = NULL;
+    draw_text_prim(hdc, p, xf, pc, fc, draw_text, o->bg_white, cw, ch);
     return;
   }
-  if (!prim_visible(p, xf, cw, ch))
-    return;
-  COLORREF col = adjust_color(p->color, o->bg_white);
-  if (p->kind == KP_POINT) {
-    double x, y;
-    xf_apply(xf, p->p[0].x, p->p[0].y, &x, &y);
-    /* small cross marker */
-    int s = 3;
-    HPEN pen = get_pen(pc, col, DPS_SOLID, o->pen_width);
-    HPEN old = (HPEN)SelectObject(hdc, pen);
-    MoveToEx(hdc, (int)(x - s), (int)y, NULL);
-    LineTo(hdc, (int)(x + s), (int)y);
-    MoveToEx(hdc, (int)x, (int)(y - s), NULL);
-    LineTo(hdc, (int)x, (int)(y + s));
-    SelectObject(hdc, old);
-    return;
-  }
+
   POINT dev[2048];
-  int n = prim_to_dev(p, xf, dev, 2048);
+  int minx, miny, maxx, maxy;
+  int n = prim_to_dev_box(p, xf, dev, 2048, &minx, &miny, &maxx, &maxy);
+  if (n < 1)
+    return;
+
+  /* viewport cull */
+  const int margin = 8;
+  if (maxx < -margin || minx > cw + margin || maxy < -margin ||
+      miny > ch + margin) {
+    DINC(d_culled);
+    return;
+  }
+
+  if (p->kind == KP_POINT) {
+    DINC(d_points);
+    int x = dev[0].x, y = dev[0].y;
+    const int s = 3;
+    batch_flush(hdc, bat);
+    bat->pen = NULL;
+    COLORREF col = adjust_color(p->color, o->bg_white);
+    HPEN pen = get_pen(pc, col, DPS_SOLID, o->pen_width);
+    if (*cur_pen != pen) {
+      SelectObject(hdc, pen);
+      *cur_pen = pen;
+    }
+    MoveToEx(hdc, x - s, y, NULL);
+    LineTo(hdc, x + s, y);
+    MoveToEx(hdc, x, y - s, NULL);
+    LineTo(hdc, x, y + s);
+    return;
+  }
+
   if (n < 2)
     return;
-  HPEN pen = get_pen(pc, col, p->pen, o->pen_width);
-  HPEN oldpen = (HPEN)SelectObject(hdc, pen);
+
+  /* Sub-pixel stroke: both extents round to a single device pixel, so the
+     stroke is invisible at this zoom. Skipping it saves a lot of GDI work
+     when a large drawing is fitted into a small window. */
+  if (!p->fill && o->pen_width <= 1 && maxx == minx && maxy == miny) {
+    DINC(d_subpx);
+    return;
+  }
+
+  COLORREF col = adjust_color(p->color, o->bg_white);
   if (p->fill) {
+    DINC(d_fills);
+    batch_flush(hdc, bat);
+    bat->pen = NULL;
+    HPEN pen = get_pen(pc, col, p->pen, o->pen_width);
+    if (*cur_pen != pen) {
+      SelectObject(hdc, pen);
+      *cur_pen = pen;
+    }
     HBRUSH br;
     int del = 0;
     if (p->fill == 1) {
@@ -493,30 +679,54 @@ static void draw_prim(HDC hdc, KPrim *p, const XForm *xf, const DrawOpts *o,
       /* фон штрихового браша = фон окна, чтобы не закрашивать промежутки */
       SetBkColor(hdc, o->bg_white ? RGB(255, 255, 255) : RGB(0, 0, 0));
     }
-    HBRUSH oldbr = (HBRUSH)SelectObject(hdc, br);
+    HBRUSH oldbr;
+    if (del) {
+      oldbr = (HBRUSH)SelectObject(hdc, br);
+    } else if (*cur_brush != br) {
+      oldbr = (HBRUSH)SelectObject(hdc, br);
+      *cur_brush = br;
+    } else {
+      oldbr = br;
+    }
     /* WINDING вместо ALTERNATE: убирает ложные «дыры» внутри контура при
        самопересечении петель (частые артефакты штриховок) */
     int oldmode = SetPolyFillMode(hdc, WINDING);
     Polygon(hdc, dev, n);
     SetPolyFillMode(hdc, oldmode);
-    SelectObject(hdc, oldbr);
-    if (del)
+    if (del) {
+      SelectObject(hdc, oldbr);
       DeleteObject(br);
-  } else {
-    Polyline(hdc, dev, n);
+      *cur_brush = NULL;
+    }
+    return;
   }
-  SelectObject(hdc, oldpen);
+
+  /* stroke: extend the current batch, switching pens only between batches */
+  DINC(d_strokes);
+  HPEN pen = get_pen(pc, col, p->pen, o->pen_width);
+  if (bat->pen != pen) {
+    batch_flush(hdc, bat); /* draw the previous run with its own pen */
+    if (*cur_pen != pen) {
+      SelectObject(hdc, pen);
+      *cur_pen = pen;
+    }
+    bat->pen = pen;
+  }
+  batch_append(hdc, bat, dev, n);
 }
 
 static void draw_block_rec(HDC hdc, DwgModel *m, int bi, const XForm *parent,
                            const DrawOpts *o, int depth, int cw, int ch,
-                           int draw_text, PenEnt *pc, TextFontEnt *fc)
+                           int draw_text, PenEnt *pc, TextFontEnt *fc,
+                           HPEN *cur_pen, HBRUSH *cur_brush,
+                           StrokeBatch *bat)
 {
   if (bi < 0 || bi >= m->n_blocks || depth > 48)
     return;
   MBlock *b = &m->blocks[bi];
   for (int i = 0; i < b->n_prims; i++)
-    draw_prim(hdc, &b->prims[i], parent, o, cw, ch, draw_text, pc, fc);
+    draw_prim(hdc, &b->prims[i], parent, o, cw, ch, draw_text, pc, fc,
+              cur_pen, cur_brush, bat);
   for (int i = 0; i < b->n_inserts; i++) {
     MInsert *ir = &b->inserts[i];
     if (ir->target < 0)
@@ -530,7 +740,7 @@ static void draw_block_rec(HDC hdc, DwgModel *m, int bi, const XForm *parent,
     xf_translate(&t, ir->pos.x, ir->pos.y);
     xf_mul(&t, parent);                        /* t = parent ∘ (T∘R∘S) */
     draw_block_rec(hdc, m, ir->target, &t, o, depth + 1, cw, ch, draw_text,
-                   pc, fc);
+                   pc, fc, cur_pen, cur_brush, bat);
   }
 }
 
@@ -566,6 +776,7 @@ int draw_model(HDC hdc, DwgModel *m, const XForm *view, int cw, int ch,
 {
   if (!m)
     return 0;
+  ULONGLONG t0 = GetTickCount64();
   RECT rc = { 0, 0, cw, ch };
   COLORREF bg = o->bg_white ? RGB(255, 255, 255) : RGB(0, 0, 0);
   HBRUSH bgb = CreateSolidBrush(bg);
@@ -579,13 +790,49 @@ int draw_model(HDC hdc, DwgModel *m, const XForm *view, int cw, int ch,
 
   int saved = SaveDC(hdc);
   IntersectClipRect(hdc, 0, 0, cw, ch);
+  HPEN cur_pen = NULL;
+  HBRUSH cur_brush = NULL;
+  StrokeBatch bat;
+  memset(&bat, 0, sizeof(bat));
   draw_block_rec(hdc, m, m->render_block, view, o, 0, cw, ch, draw_text,
-                 pens, fonts);
+                 pens, fonts, &cur_pen, &cur_brush, &bat);
+  batch_flush(hdc, &bat);
   draw_extent_frame(hdc, m, view, cw, ch, o->bg_white);
   RestoreDC(hdc, saved);
+  batch_free(&bat);
 
   pen_cache_clear(pens, PEN_CACHE_MAX);
   text_font_clear(fonts);
+
+#ifdef PROFILE_ENABLED
+  {
+    char buf[200];
+    snprintf(buf, sizeof(buf),
+             "[PERF] draw_model %dx%d: delta %llu ms", cw, ch,
+             (unsigned long long)(GetTickCount64() - t0));
+    model_perf_log(buf);
+    snprintf(buf, sizeof(buf),
+             "[STAT] draw prims: strokes=%lu fills=%lu texts=%lu points=%lu"
+             " culled=%lu subpx=%lu batches=%lu",
+             d_strokes, d_fills, d_texts, d_points, d_culled, d_subpx,
+             d_batches);
+    model_perf_log(buf);
+    snprintf(buf, sizeof(buf),
+             "[STAT] text: drawn=%lu small=%lu culled=%lu minpx=%.1f"
+             " hpx=[%.1f..%.1f] limit=%.1f",
+             d_text_drawn, d_text_small, d_text_cull,
+             d_text_drawn ? d_text_hmin : 0.0, d_text_hmin, d_text_hmax,
+             g_text_min_px);
+    model_perf_log(buf);
+    d_strokes = d_fills = d_texts = d_points = d_culled = d_subpx =
+        d_batches = 0;
+    d_text_drawn = d_text_small = d_text_cull = 0;
+    d_text_hmin = 1e9;
+    d_text_hmax = 0;
+  }
+#else
+  (void)t0;
+#endif
   return 1;
 }
 

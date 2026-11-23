@@ -50,6 +50,16 @@ typedef struct {
 
 static HMODULE g_dll_handle;
 
+/* Forward declarations for profiling */
+static void log_append_ansi(const char *line);
+void model_set_perf_log_cb(void (*cb)(const char *msg));
+
+/* Profiling callback for model.c */
+static void perf_log_callback(const char *msg)
+{
+  log_append_ansi(msg);
+}
+
 typedef struct {
   HWND hWnd;
   WCHAR file[MAX_PATH];
@@ -68,7 +78,18 @@ typedef struct {
 
   /* content device rect (recomputed from view) */
   RECT dev_content;
+
+  /* asynchronous loading */
+  HANDLE hThread;
+  volatile LONG loading;   /* 1 while the model is being parsed */
+  volatile LONG closing;   /* window is going away; do not post messages */
+  volatile LONG refs;      /* window owner + loader thread */
+  DWORD load_start;
+  wchar_t load_err[512];
 } ViewCtx;
+
+#define WM_APP_DWG_LOADED (WM_APP + 10)
+#define TIMER_LOADING 1
 
 static wchar_t g_ini_path[MAX_PATH];
 static int g_class_registered;
@@ -395,7 +416,22 @@ static LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wParam,
     DrawOpts o;
     memset(&o, 0, sizeof(o));
     o.bg_white = v ? v->bg_white : 0;
-    if (v && v->model && v->model->has_content)
+    int loading = v && InterlockedCompareExchange(&v->loading, 0, 0);
+    if (loading) {
+      RECT fr = { 0, 0, w, h };
+      HBRUSH hb = CreateSolidBrush(v->bg_white ? RGB(255, 255, 255)
+                                               : RGB(0, 0, 0));
+      FillRect(mdc, &fr, hb);
+      DeleteObject(hb);
+      wchar_t msg[160];
+      DWORD secs = (GetTickCount() - v->load_start) / 1000;
+      _snwprintf(msg, 160, L"Чтение DWG…  %lu с", (unsigned long)secs);
+      SetBkMode(mdc, TRANSPARENT);
+      SetTextColor(mdc, v->bg_white ? RGB(0, 0, 0) : RGB(255, 255, 255));
+      RECT tr = { 16, 16, w - 16, h - 16 };
+      DrawTextW(mdc, msg, -1, &tr,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    } else if (v && v->model && v->model->has_content)
       draw_model(mdc, v->model, &v->view, w, h, &o, 1);
     else {
       RECT fr = { 0, 0, w, h };
@@ -403,10 +439,13 @@ static LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wParam,
                                                     : RGB(0, 0, 0));
       FillRect(mdc, &fr, hb);
       DeleteObject(hb);
-      const wchar_t *msg1 =
-          v && v->model && !v->model->has_content
-              ? L"Чертёж пуст или не содержит объектов."
-              : L"Не удалось загрузить файл.";
+      const wchar_t *msg1;
+      if (v && v->model && !v->model->has_content)
+        msg1 = L"Чертёж пуст или не содержит объектов.";
+      else if (v && v->load_err[0])
+        msg1 = v->load_err;
+      else
+        msg1 = L"Не удалось загрузить файл.";
       SetBkMode(mdc, TRANSPARENT);
       SetTextColor(mdc, v && v->bg_white ? RGB(0, 0, 0) : RGB(255, 255, 255));
       RECT tr = { 8, 8, w - 8, h - 8 };
@@ -540,7 +579,25 @@ static LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wParam,
       update_scrollbars(v);
     }
     return 0;
+  case WM_TIMER:
+    if (wParam == TIMER_LOADING) {
+      if (v && InterlockedCompareExchange(&v->loading, 0, 0))
+        InvalidateRect(hwnd, NULL, FALSE);
+      else
+        KillTimer(hwnd, TIMER_LOADING);
+    }
+    return 0;
+  case WM_APP_DWG_LOADED:
+    if (v) {
+      KillTimer(hwnd, TIMER_LOADING);
+      if (v->need_fit)
+        ctx_fit(v);
+      update_scrollbars(v);
+      InvalidateRect(hwnd, NULL, FALSE);
+    }
+    return 0;
   case WM_DESTROY:
+    KillTimer(hwnd, TIMER_LOADING);
     return 0;
   }
   return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -552,6 +609,27 @@ static LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wParam,
 /* ------------------------------------------------------------------ */
 /* debug log (written next to the plugin)                              */
 
+/* The loader thread and the UI thread both append diagnostics. */
+static CRITICAL_SECTION g_log_cs;
+static LONG g_log_cs_state = 0;
+
+static void log_lock(void)
+{
+  if (InterlockedCompareExchange(&g_log_cs_state, 1, 0) == 0) {
+    InitializeCriticalSection(&g_log_cs);
+    InterlockedExchange(&g_log_cs_state, 2);
+  } else {
+    while (g_log_cs_state != 2)
+      Sleep(0);
+  }
+  EnterCriticalSection(&g_log_cs);
+}
+
+static void log_unlock(void)
+{
+  LeaveCriticalSection(&g_log_cs);
+}
+
 static void log_append(const wchar_t *line)
 {
   wchar_t path[MAX_PATH];
@@ -560,9 +638,12 @@ static void log_append(const wchar_t *line)
   if (slash)
     *(slash + 1) = 0;
   wcscat(path, L"dwgviewer.log");
+  log_lock();
   FILE *f = _wfopen(path, L"ab");
-  if (!f)
+  if (!f) {
+    log_unlock();
     return;
+  }
   /* translate wide to UTF-8 and append */
   char buf[1200];
   int n = WideCharToMultiByte(CP_UTF8, 0, line, -1, buf, sizeof(buf), NULL, NULL);
@@ -571,6 +652,50 @@ static void log_append(const wchar_t *line)
     fwrite("\n", 1, 1, f);
   }
   fclose(f);
+  log_unlock();
+}
+
+static void log_append_ansi(const char *line)
+{
+  wchar_t path[MAX_PATH];
+  GetModuleFileNameW(g_dll_handle, path, MAX_PATH);
+  wchar_t *slash = wcsrchr(path, L'\\');
+  if (slash)
+    *(slash + 1) = 0;
+  wcscat(path, L"dwgviewer.log");
+  log_lock();
+  FILE *f = _wfopen(path, L"ab");
+  if (!f) {
+    log_unlock();
+    return;
+  }
+  if (line) {
+    fwrite(line, 1, strlen(line), f);
+    fwrite("\n", 1, 1, f);
+  }
+  fclose(f);
+  log_unlock();
+}
+
+static void log_open_result(ViewCtx *v, wchar_t *return_log, int rl_len);
+
+static DWORD WINAPI load_thread(LPVOID param);
+
+static void view_release(ViewCtx *v)
+{
+  if (!v)
+    return;
+  if (InterlockedDecrement(&v->refs) > 0)
+    return;
+  if (v->hThread) {
+    CloseHandle(v->hThread);
+    v->hThread = NULL;
+  }
+  if (v->model) {
+    model_release(v->model);
+    v->model = NULL;
+  }
+  free(v);
 }
 
 static ViewCtx *create_view(const WCHAR *file, HWND parent, int showflags,
@@ -581,23 +706,10 @@ static ViewCtx *create_view(const WCHAR *file, HWND parent, int showflags,
     return NULL;
   wcsncpy(v->file, file, MAX_PATH - 1);
   v->bg_white = 0;
+  v->refs = 1;
 
-  wchar_t errbuf[512];
-  v->model = model_load(file, errbuf, 512);
-
-  {
-    /* always write a short diagnostic line next to the plugin */
-    wchar_t line[560];
-    if (v->model) {
-      _snwprintf(line, 560, L"OPEN %ls -> OK (v=%hs, objects=%u)", file,
-                 v->model->version, v->model->obj_count);
-    } else {
-      _snwprintf(line, 560, L"OPEN %ls -> FAIL: %ls", file, errbuf);
-    }
-    log_append(line);
-    if (return_log && rl_len > 0)
-      _snwprintf(return_log, rl_len, L"%ls", line);
-  }
+  /* Set profiling callback */
+  model_set_perf_log_cb(perf_log_callback);
 
   wchar_t ini[MAX_PATH];
   GetModuleFileNameW(g_dll_handle, ini, MAX_PATH);
@@ -610,6 +722,18 @@ static ViewCtx *create_view(const WCHAR *file, HWND parent, int showflags,
     v->bg_white = 1;
   v->flipX = GetPrivateProfileIntW(L"Options", L"FlipX", 0, ini) == 1;
   v->flipY = GetPrivateProfileIntW(L"Options", L"FlipY", 0, ini) == 1;
+  model_set_cache_enabled(
+      GetPrivateProfileIntW(L"Options", L"CacheModel", 1, ini) != 0);
+  draw_set_text_min_px(
+      (double)GetPrivateProfileIntW(L"Options", L"TextMinPx", 4, ini));
+  {
+    int ws = GetPrivateProfileIntW(L"Options", L"TextWidthScale", 100, ini);
+    if (ws < 20)
+      ws = 20;
+    if (ws > 300)
+      ws = 300;
+    draw_set_text_width_scale((double)ws / 100.0);
+  }
 
   v->hWnd = CreateWindowExW(0, VIEW_CLASS, file,
                             WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL,
@@ -634,13 +758,89 @@ static ViewCtx *create_view(const WCHAR *file, HWND parent, int showflags,
     _snwprintf(logline, 256, L"  create window failed (err=%d), ListLoadW -> NULL",
                GetLastError());
     log_append(logline);
-    model_free(v->model);
     free(v);
     return NULL;
   }
   SetWindowLongPtrW(v->hWnd, GWLP_USERDATA, (LONG_PTR)v);
   v->need_fit = 1;
+
+  /* Parse in the background so Total Commander is not blocked for the
+     duration of a large drawing. The window paints a progress message
+     until WM_APP_DWG_LOADED arrives. A tiny synchronously loaded file
+     still goes through the same path. */
+  v->load_start = GetTickCount();
+  InterlockedExchange(&v->loading, 1);
+  InterlockedIncrement(&v->refs); /* the loader thread owns a reference */
+  v->hThread = CreateThread(NULL, 0, load_thread, v, CREATE_SUSPENDED, NULL);
+  if (v->hThread) {
+    SetTimer(v->hWnd, TIMER_LOADING, 200, NULL);
+    ResumeThread(v->hThread);
+    return v;
+  }
+
+  /* Thread creation failed: fall back to loading on this thread. */
+  InterlockedDecrement(&v->refs);
+  InterlockedExchange(&v->loading, 0);
+  v->model = model_acquire(file, v->load_err, 512);
+  log_open_result(v, return_log, rl_len);
   return v;
+}
+
+static void log_open_result(ViewCtx *v, wchar_t *return_log, int rl_len)
+{
+  wchar_t line[620];
+  DWORD el = v->load_start ? (GetTickCount() - v->load_start) : 0;
+  if (v->model) {
+    _snwprintf(line, 620, L"OPEN %ls -> OK (v=%hs, objects=%u, texts=%lu, %lu ms)",
+               v->file, v->model->version, v->model->obj_count,
+               v->model->n_texts, (unsigned long)el);
+  } else {
+    _snwprintf(line, 620, L"OPEN %ls -> FAIL: %ls", v->file,
+               v->load_err[0] ? v->load_err : L"неизвестная ошибка");
+  }
+  log_append(line);
+  if (return_log && rl_len > 0)
+    wcsncpy(return_log, line, (size_t)rl_len - 1);
+}
+
+static int load_cancelled(void *ctx)
+{
+  ViewCtx *v = (ViewCtx *)ctx;
+  return v->closing != 0;
+}
+
+static DWORD WINAPI load_thread(LPVOID param)
+{
+  ViewCtx *v = (ViewCtx *)param;
+
+  if (InterlockedCompareExchange(&v->closing, 0, 0)) {
+    view_release(v);
+    return 0;
+  }
+
+  DwgModel *m =
+      model_acquire_ex(v->file, v->load_err, 512, load_cancelled, v);
+
+  if (InterlockedCompareExchange(&v->closing, 0, 0)) {
+    if (m)
+      model_release(m);
+    view_release(v);
+    return 0;
+  }
+
+  v->model = m;
+  MemoryBarrier();
+  InterlockedExchange(&v->loading, 0);
+
+  log_open_result(v, NULL, 0);
+
+  {
+    HWND h = v->hWnd;
+    if (h)
+      PostMessageW(h, WM_APP_DWG_LOADED, 0, 0);
+  }
+  view_release(v);
+  return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -650,6 +850,7 @@ static ViewCtx *create_view(const WCHAR *file, HWND parent, int showflags,
 HWND __stdcall ListLoadW(HWND parentWin, WCHAR *fileToLoad, int showFlags)
 {
   wchar_t olog[600];
+  olog[0] = 0;
   wchar_t line[720];
   if (!fileToLoad) {
     log_append(L"ListLoadW: NULL file");
@@ -665,10 +866,12 @@ HWND __stdcall ListLoadW(HWND parentWin, WCHAR *fileToLoad, int showFlags)
     return NULL;
   }
   /* if the model could not be parsed at all, refuse so TC can try other
-     plugins; if it parsed but is empty we still show a message */
-  if (!v->model) {
+     plugins; if it parsed but is empty we still show a message.
+     While loading asynchronously the model is not available yet. */
+  if (!InterlockedCompareExchange(&v->loading, 0, 0) && !v->model) {
     DestroyWindow(v->hWnd);
-    free(v);
+    v->hWnd = NULL;
+    view_release(v);
     _snwprintf(line, 720, L"ListLoadW -> NULL (model) %ls", olog);
     log_append(line);
     return NULL;
@@ -683,8 +886,11 @@ void __stdcall ListCloseWindowW(HWND listWin)
   ViewCtx *v = (ViewCtx *)GetWindowLongPtrW(listWin, GWLP_USERDATA);
   if (v) {
     SetWindowLongPtrW(listWin, GWLP_USERDATA, 0);
-    model_free(v->model);
-    free(v);
+    InterlockedExchange(&v->closing, 1);
+    KillTimer(listWin, TIMER_LOADING);
+    DestroyWindow(listWin);
+    view_release(v);
+    return;
   }
   DestroyWindow(listWin);
 }
@@ -849,9 +1055,9 @@ HBITMAP __stdcall ListGetPreviewBitmapW(WCHAR *fileToLoad, int width,
   if (!fileToLoad || width < 16 || height < 16)
     return NULL;
   wchar_t errbuf[256];
-  DwgModel *m = model_load(fileToLoad, errbuf, 256);
+  DwgModel *m = model_acquire(fileToLoad, errbuf, 256);
   if (!m || !m->has_content) {
-    model_free(m);
+    model_release(m);
     return NULL;
   }
   HDC sdc = GetDC(NULL);
@@ -878,7 +1084,7 @@ HBITMAP __stdcall ListGetPreviewBitmapW(WCHAR *fileToLoad, int width,
   }
   DeleteDC(mdc);
   ReleaseDC(NULL, sdc);
-  model_free(m);
+  model_release(m);
   return bm;
 }
 

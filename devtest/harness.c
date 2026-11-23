@@ -1,7 +1,18 @@
 /* harness.c - end-to-end test of dwgviewer.wlx without Total Commander */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <psapi.h>
 #include <stdio.h>
+
+static void print_mem(const char *tag)
+{
+  PROCESS_MEMORY_COUNTERS pmc;
+  memset(&pmc, 0, sizeof(pmc));
+  if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+    printf("[mem] %s: working=%llu MB peak=%llu MB\n", tag,
+           (unsigned long long)(pmc.WorkingSetSize >> 20),
+           (unsigned long long)(pmc.PeakWorkingSetSize >> 20));
+}
 
 typedef struct {
   int size;
@@ -199,7 +210,8 @@ int main(int argc, char **argv)
   MultiByteToWideChar(CP_ACP, 0, argv[1], -1, wpath, 1024);
 
   /* 1) preview bitmap */
-  HBITMAP pv = preview(wpath, 320, 240, NULL, 0);
+  HBITMAP pv = getenv("HARNESS_NOPREVIEW") ? NULL
+                                           : preview(wpath, 320, 240, NULL, 0);
   if (pv) {
     printf("preview OK\n");
     save_hbitmap(out1, pv, 320, 240);
@@ -231,16 +243,65 @@ int main(int argc, char **argv)
   ShowWindow(parent, SW_SHOW);
   UpdateWindow(parent);
 
+  ULONGLONG t_load0 = GetTickCount64();
+  print_mem("before load");
   HWND child = load(parent, wpath, 0);
+  ULONGLONG t_load1 = GetTickCount64();
   if (!child) {
     printf("ListLoadW returned NULL\n");
     DestroyWindow(parent);
     return 1;
   }
+  printf("ListLoadW latency: %llu ms\n",
+         (unsigned long long)(t_load1 - t_load0));
   RECT cr;
   GetClientRect(parent, &cr);
   MoveWindow(child, 0, 0, cr.right - cr.left, cr.bottom - cr.top, TRUE);
   printf("[h after move]\n");
+  /* The plugin loads in the background; pump messages until the window has
+     had time to receive the model (or the timeout expires). */
+  if (getenv("HARNESS_WAITLOAD")) {
+    /* let the window paint its "loading" screen first */
+    UpdateWindow(child);
+    for (int i = 0; i < 5; i++) {
+      MSG m0;
+      if (PeekMessageW(&m0, NULL, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&m0);
+        DispatchMessageW(&m0);
+      }
+      Sleep(20);
+    }
+    char lp[512];
+    snprintf(lp, sizeof(lp), "%s\\loading.bmp", outdir);
+    capture_window(child, cr.right - cr.left, cr.bottom - cr.top, lp);
+    int waited = 0;
+    ULONGLONG t0 = GetTickCount64();
+    const char *ew = getenv("HARNESS_WAITMS");
+    int limit = ew ? atoi(ew) : 8000;
+    while ((int)(GetTickCount64() - t0) < limit) {
+      MSG m2;
+      if (PeekMessageW(&m2, NULL, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&m2);
+        DispatchMessageW(&m2);
+      } else {
+        Sleep(10);
+      }
+      waited++;
+      if (waited == 10)
+        printf("[loading at 100ms]\n");
+    }
+    printf("wait for load: %llu ms\n",
+           (unsigned long long)(GetTickCount64() - t0));
+    print_mem("after load");
+  }
+  if (getenv("HARNESS_CLOSEEARLY")) {
+    printf("closing while loading\n");
+    close(child);
+    DestroyWindow(parent);
+    FreeLibrary(h);
+    printf("closed ok\n");
+    return 0;
+  }
   /* plugin fits on need_fit during WM_SIZE; make sure a paint happens */
   UpdateWindow(child);
   printf("[h after update]\n");

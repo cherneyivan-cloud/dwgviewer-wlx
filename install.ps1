@@ -15,6 +15,7 @@
 #     ... -UserPluginDir "D:\Plugins\DwgViewer"
 #     ... -FixIni                         move a read-only wincmd.ini to the profile
 #     ... -NoIniUpdate                    only copy the files
+#     ... -Update                         upgrade: close Total Commander first
 #     ... -Uninstall                      remove the plugin and its registration
 # ============================================================================
 [CmdletBinding()]
@@ -23,6 +24,7 @@ param(
     [string]$IniPath,
     [string]$UserPluginDir,
     [switch]$NoIniUpdate,
+    [switch]$Update,
     [switch]$Uninstall,
     [switch]$FixIni,
     [switch]$Quiet
@@ -33,6 +35,9 @@ $script_dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 $plugin_name   = 'DwgViewer'
 $plugin_dll    = 'dwgviewer.wlx'
+# Total Commander x64 loads the "*64" lister name when that file exists, so
+# both names must always contain the same build.
+$plugin_dll64  = 'dwgviewer.wlx64'
 $runtime_dll   = 'libredwg-0.dll'
 $ini_section   = 'ListerPlugins'
 $ini_section64 = 'ListerPlugins64'
@@ -437,6 +442,32 @@ if (-not (Test-DirWritable $plugin_dir)) {
 }
 Write-Ok "Folder: $plugin_dir"
 
+# --- Update: Total Commander keeps dwgviewer.wlx64 mapped, so it has to be
+#     closed before the new DLL can replace the old one.
+if ($Update) {
+    $running = Get-Process -Name 'totalcmd64', 'totalcmd' -ErrorAction SilentlyContinue
+    if ($running) {
+        Write-Head "Closing Total Commander for the update..."
+        foreach ($proc in $running) {
+            try { $proc.CloseMainWindow() | Out-Null } catch { }
+        }
+        $deadline = (Get-Date).AddSeconds(20)
+        while ((Get-Date) -lt $deadline -and
+               (Get-Process -Name 'totalcmd64', 'totalcmd' -ErrorAction SilentlyContinue)) {
+            Start-Sleep -Milliseconds 400
+        }
+        if (Get-Process -Name 'totalcmd64', 'totalcmd' -ErrorAction SilentlyContinue) {
+            Write-Err "Total Commander is still running."
+            Write-Note "Close it manually (it may be asking to save something) and run update again."
+            if (-not $Quiet) { Read-Host "Press Enter to exit" | Out-Null }
+            exit 1
+        }
+        Write-Ok "Total Commander closed"
+    } else {
+        Write-Ok "Total Commander is not running"
+    }
+}
+
 $zip    = Get-SourceFile 'DwgViewer-win64.zip'
 $srcDll = Get-SourceFile $plugin_dll
 $srcRt  = Get-SourceFile $runtime_dll
@@ -462,6 +493,21 @@ try {
 } catch {
     Write-Err "Could not copy the files: $($_.Exception.Message)"
     exit 1
+}
+
+# Keep dwgviewer.wlx64 in sync: a stale copy shadows the new plugin in TC x64.
+$baseDll = Join-Path $plugin_dir $plugin_dll
+$altDll  = Join-Path $plugin_dir $plugin_dll64
+if (Test-Path -LiteralPath $baseDll) {
+    try {
+        Copy-Item -LiteralPath $baseDll -Destination $altDll -Force
+        Write-Ok "Copied $plugin_dll64"
+    } catch {
+        Write-Err "Could not update $plugin_dll64 : $($_.Exception.Message)"
+        Write-Note "Total Commander x64 loads '$plugin_dll64' when it exists."
+        Write-Note "Close Total Commander completely and run install.bat again."
+        exit 1
+    }
 }
 
 $missing = @()

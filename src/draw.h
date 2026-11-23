@@ -33,6 +33,15 @@ typedef struct {
 int draw_model(HDC hdc, DwgModel *m, const XForm *view, int cw, int ch,
                const DrawOpts *o, int draw_text);
 
+/* Smallest text height (device pixels) that is still drawn. Smaller labels
+   are skipped rather than enlarged, so text never outgrows the drawing.
+   Default 4.0; 0 disables the threshold. */
+void draw_set_text_min_px(double px);
+
+/* Multiplier applied on top of the DWG width factor (DXF 41). 1.0 keeps the
+   value from the file; >1.0 renders text wider. */
+void draw_set_text_width_scale(double scale);
+
 /* Fit transform that shows the whole content with margin (px), centered. */
 int draw_fit_xform(DwgModel *m, double cw, double ch, double margin,
                    XForm *out);

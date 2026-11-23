@@ -36,7 +36,7 @@ jobs:
       - name: Package sources (сразу после checkout, пока дерево чистое)
         run: |
           mkdir dist
-          tar -a -c -f dist\DwgViewer-src.zip src build devtest .github .gitignore build.bat README.md LICENSE PUBLISH.md install.bat install.ps1 INSTALL.md
+          tar -a -c -f dist\DwgViewer-src.zip src build devtest .github .gitignore build.bat README.md LICENSE PUBLISH.md install.bat install.ps1 update.bat INSTALL.md
           dir dist
         shell: cmd
 
@@ -49,8 +49,9 @@ jobs:
           cd dist
           copy ..\install.bat . >nul
           copy ..\install.ps1 . >nul
+          copy ..\update.bat . >nul
           copy ..\INSTALL.md . >nul
-          powershell -Command "tar -a -c -f DwgViewer-win64.zip dwgviewer.wlx libredwg-0.dll README.md LICENSE install.bat install.ps1 INSTALL.md"
+          powershell -Command "tar -a -c -f DwgViewer-win64.zip dwgviewer.wlx libredwg-0.dll README.md LICENSE install.bat install.ps1 update.bat INSTALL.md"
           dir
         shell: cmd
 

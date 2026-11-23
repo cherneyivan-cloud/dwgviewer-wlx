@@ -7,14 +7,78 @@
 #include <stdio.h>
 #include <math.h>
 #include <wchar.h>
+#include <windows.h>
 
 #include "model.h"
 #include "aci.h"
 #include "draw.h"
 #include "dwgload.h"
 
-/* ------------------------------------------------------------------ */
-/* tiny dynamic array helpers                                         */
+/* ================================================================== */
+/* Profiling helpers (timing instrumentation)                         */
+/* ================================================================== */
+
+/* Callback set by dwgwlx.c to log perf messages to file */
+typedef void (*PerfLogCallback)(const char *msg);
+static PerfLogCallback g_perf_log_cb = NULL;
+
+void model_set_perf_log_cb(PerfLogCallback cb)
+{
+  g_perf_log_cb = cb;
+}
+
+void model_perf_log(const char *msg)
+{
+  if (!msg)
+    return;
+  if (g_perf_log_cb)
+    g_perf_log_cb(msg);
+  else
+    fprintf(stderr, "%s\n", msg);
+}
+
+#ifdef PROFILE_ENABLED
+static void perf_log_msg(const char *msg)
+{
+  if (g_perf_log_cb)
+    g_perf_log_cb(msg);
+  fprintf(stderr, "%s\n", msg);
+}
+#else
+#define perf_log_msg(m) do { (void)(m); } while (0)
+#endif
+
+#ifdef PROFILE_ENABLED
+static ULONGLONG perf_mark(const char *label)
+{
+  ULONGLONG t = GetTickCount64();
+  char buf[256];
+  snprintf(buf, sizeof(buf), "[PERF] %s: %llu ms", label, t);
+  perf_log_msg(buf);
+  return t;
+}
+
+static void perf_delta(const char *label, ULONGLONG t0)
+{
+  ULONGLONG t1 = GetTickCount64();
+  char buf[256];
+  snprintf(buf, sizeof(buf), "[PERF] %s: delta %llu ms", label, t1 - t0);
+  perf_log_msg(buf);
+}
+
+static void perf_stat(const char *label, unsigned long value)
+{
+  char buf[256];
+  snprintf(buf, sizeof(buf), "[STAT] %s: %lu", label, value);
+  perf_log_msg(buf);
+}
+#else
+#define perf_mark(l) (0ULL)
+#define perf_delta(l, t) do { (void)(t); } while (0)
+#define perf_stat(l, v) do { (void)(v); } while (0)
+#endif
+
+/* ================================================================== */
 
 static KPrim *prim_append(MBlock *b)
 {
@@ -29,6 +93,7 @@ static KPrim *prim_append(MBlock *b)
   KPrim *p = &b->prims[b->n_prims];
   memset(p, 0, sizeof(*p));
   b->n_prims++;
+  b->prim_emitted++;  /* track emission count */
   return p;
 }
 
@@ -230,10 +295,53 @@ static wchar_t *finish_text_w(const wchar_t *in)
       if (nx == L'\\') { tmp[n++] = L'\\'; i += 2; continue; }
       if (nx == L'{') { tmp[n++] = L'{'; i += 2; continue; }
       if (nx == L'}') { tmp[n++] = L'}'; i += 2; continue; }
-      /* коды с параметрами (до ';'): \A1; \C1; \fArial|...; \H..; \W..; \S..; \Q..; \T..; \p.. */
+      /* \U+XXXX — Unicode-символ, записанный кодом (часто в MTEXT из
+         русских версий CAD). Без этого в тексте оставалось "+041E+0431". */
+      if ((nx == L'U' || nx == L'u') && in[i + 2] == L'+') {
+        unsigned int code = 0;
+        int ok = 1;
+        for (int k = 0; k < 4; k++) {
+          wchar_t ch = in[i + 3 + k];
+          int v;
+          if (ch >= L'0' && ch <= L'9')
+            v = ch - L'0';
+          else if (ch >= L'A' && ch <= L'F')
+            v = ch - L'A' + 10;
+          else if (ch >= L'a' && ch <= L'f')
+            v = ch - L'a' + 10;
+          else {
+            ok = 0;
+            break;
+          }
+          code = (code << 4) | (unsigned int)v;
+        }
+        if (ok) {
+          if (n < 4088)
+            tmp[n++] = (wchar_t)code;
+          i += 7;
+          continue;
+        }
+      }
+      /* \S = stacked text (fraction). Keep the content: "1^2" -> "1/2". */
+      if (nx == L'S' || nx == L's') {
+        i += 2;
+        while (in[i] && in[i] != L';' && n < 4085) {
+          if (in[i] == L'^')
+            tmp[n++] = L'/';
+          else if (in[i] == L'#')
+            tmp[n++] = L'/';
+          else
+            tmp[n++] = in[i];
+          i++;
+        }
+        if (in[i] == L';')
+          i++;
+        continue;
+      }
+      /* коды с параметрами (до ';'): \A1; \C1; \fArial|...; \H..; \W..; \Q..; \T..; \p.. */
       if (nx == L'A' || nx == L'a' || nx == L'C' || nx == L'c' ||
           nx == L'F' || nx == L'f' || nx == L'H' || nx == L'h' ||
-          nx == L'Q' || nx == L'q' || nx == L'S' || nx == L's' ||
+          nx == L'Q' || nx == L'q' ||
           nx == L'T' || nx == L't' || nx == L'W' || nx == L'w' ||
           nx == L'p') {
         i += 2;
@@ -369,22 +477,24 @@ static wchar_t *make_text_w(const char *utf8)
 
 static void emit_text_wrap(MBlock *b, MPt pos, double height, double rot,
                            const char *utf8, COLORREF color, double wrap,
-                           int attach, double linespace);
+                           int attach, double linespace, double wf);
 
 static void emit_text(MBlock *b, MPt pos, double height, double rot,
                       const char *utf8, COLORREF color)
 {
-  emit_text_wrap(b, pos, height, rot, utf8, color, 0.0, 0, 1.0);
+  emit_text_wrap(b, pos, height, rot, utf8, color, 0.0, 0, 1.0, 1.0);
 }
 
 static void emit_text_wrap(MBlock *b, MPt pos, double height, double rot,
                            const char *utf8, COLORREF color, double wrap,
-                           int attach, double linespace)
+                           int attach, double linespace, double wf)
 {
   if (height <= 0 || height > 1e12)
     height = 1e-5;
   if (!is_fin(height) || !is_fin(pos.x) || !is_fin(pos.y))
     return;
+  if (!is_fin(wf) || wf < 0.01 || wf > 100.0)
+    wf = 1.0;
   wchar_t *w = make_text_w(utf8);
   if (!w)
     return;
@@ -398,7 +508,9 @@ static void emit_text_wrap(MBlock *b, MPt pos, double height, double rot,
   p->wrap_width = (is_fin(wrap) && wrap > 0) ? wrap : 0.0;
   p->attach = (attach >= 1 && attach <= 9) ? attach : 0;
   p->linespace = (is_fin(linespace) && linespace > 0) ? linespace : 1.0;
+  p->wf = wf;
   p->text = w;
+  b->n_texts++;
 }
 
 /* ------------------------------------------------------------------ */
@@ -860,13 +972,16 @@ static void entity_text(MBlock *b, Dwg_Data *dwg, Dwg_Entity_TEXT *e,
   if (!e)
     return;
   MPt pos = {e->ins_pt.x, e->ins_pt.y};
-  emit_text(b, pos, e->height, e->rotation, e->text_value, color);
+  double wf = e->width_factor;
+  if (!is_fin(wf) || wf < 0.01 || wf > 100.0)
+    wf = 1.0;
+  emit_text_wrap(b, pos, e->height, e->rotation, e->text_value, color, 0.0, 0,
+                 1.0, wf);
 }
 
 static void entity_mtext(MBlock *b, Dwg_Data *dwg, Dwg_Entity_MTEXT *e,
                          COLORREF color)
 {
-  (void)dwg;
   if (!e)
     return;
   double rot = 0;
@@ -875,8 +990,20 @@ static void entity_mtext(MBlock *b, Dwg_Data *dwg, Dwg_Entity_MTEXT *e,
   MPt pos = {e->ins_pt.x, e->ins_pt.y};
   int attach = (e->attachment >= 1 && e->attachment <= 9) ? e->attachment : 1;
   double lsf = (e->linespace_factor > 0) ? e->linespace_factor : 1.0;
+  /* MTEXT has no per-entity width factor; it inherits the text style's
+     width factor (DXF 41 of the STYLE table entry). */
+  double wf = 1.0;
+  if (dwg && e->style) {
+    Dwg_Object *so = dwg_ref_object(dwg, e->style);
+    if (so && so->fixedtype == DWG_TYPE_STYLE && so->tio.object &&
+        so->tio.object->tio.STYLE) {
+      double sw = so->tio.object->tio.STYLE->width_factor;
+      if (is_fin(sw) && sw > 0.01 && sw < 100.0)
+        wf = sw;
+    }
+  }
   emit_text_wrap(b, pos, e->text_height, rot, e->text, color, e->rect_width,
-                 attach, lsf);
+                 attach, lsf, wf);
 }
 
 static void entity_leader(MBlock *b, Dwg_Entity_LEADER *e, COLORREF color,
@@ -1416,6 +1543,7 @@ typedef struct {
   Dwg_Data *dwg;
   int blk;
   int depth;
+  unsigned long prim_count;  /* total primitives emitted */
 } BuildCtx;
 
 static void handle_insert(MBlock *b, const Dwg_Entity_INSERT *ins,
@@ -1585,7 +1713,11 @@ static void build_canvas(BuildCtx *ctx, Dwg_Object *base, int is_block)
         Dwg_Entity_ATTRIB *at = ent->tio.ATTRIB;
         if (at) {
           MPt pos = { at->ins_pt.x, at->ins_pt.y };
-          emit_text(b, pos, at->height, at->rotation, at->text_value, color);
+          double wf = at->width_factor;
+          if (!is_fin(wf) || wf < 0.01 || wf > 100.0)
+            wf = 1.0;
+          emit_text_wrap(b, pos, at->height, at->rotation, at->text_value,
+                         color, 0.0, 0, 1.0, wf);
         }
         break;
       }
@@ -1622,10 +1754,21 @@ static void build_canvas(BuildCtx *ctx, Dwg_Object *base, int is_block)
 /* ------------------------------------------------------------------ */
 /* extents                                                             */
 
+#define EXT_LIMIT 1e12
+
 static void ext_include(XForm *xf, double x, double y, DwgModel *m)
 {
+  if (!is_fin(x) || !is_fin(y))
+    return;
+  /* bogus coordinates far outside any real drawing (seen in the wild:
+     2e304 from a broken entity) would collapse the fit-to-window scale */
+  if (fabs(x) > EXT_LIMIT || fabs(y) > EXT_LIMIT)
+    return;
   double dx, dy;
   xf_apply(xf, x, y, &dx, &dy);
+  if (!is_fin(dx) || !is_fin(dy) || fabs(dx) > EXT_LIMIT ||
+      fabs(dy) > EXT_LIMIT)
+    return;
   if (dx < m->xmin)
     m->xmin = dx;
   if (dx > m->xmax)
@@ -1750,8 +1893,13 @@ DwgModel *model_load(const wchar_t *path, wchar_t *errbuf, int errlen)
     return NULL;
   m->render_block = -1;
 
+  ULONGLONG t_start = perf_mark("model_load START");
+
   Dwg_Data *dwg = &m->dwg;
+  ULONGLONG t_read = perf_mark("dwg_read_file");
   int err = read_dwg(path, dwg);
+  perf_delta("dwg_read_file", t_read);
+  
   if (err >= DWG_ERR_CRITICAL) {
     /* still build an empty model with a message */
     if (errbuf) {
@@ -1771,8 +1919,10 @@ DwgModel *model_load(const wchar_t *path, wchar_t *errbuf, int errlen)
   snprintf(m->version, sizeof(m->version), "%s",
            dwg_version_type(dwg->header.version));
   m->obj_count = dwg->num_objects;
+  fprintf(stderr, "[MODEL] DWG v%s, objects=%u\n", m->version, dwg->num_objects);
 
   /* ---- build one canvas per block header ---- */
+  ULONGLONG t_pass1 = perf_mark("PASS1: count blocks");
   int nblocks = 0;
   for (unsigned int i = 0; i < dwg->num_objects; i++) {
     Dwg_Object *obj = &dwg->object[i];
@@ -1780,6 +1930,7 @@ DwgModel *model_load(const wchar_t *path, wchar_t *errbuf, int errlen)
         obj->fixedtype == DWG_TYPE_BLOCK_HEADER)
       nblocks++;
   }
+  perf_delta("PASS1: count blocks", t_pass1);
   if (nblocks == 0) {
     if (errbuf && errlen > 0)
       _snwprintf(errbuf, errlen,
@@ -1796,9 +1947,12 @@ DwgModel *model_load(const wchar_t *path, wchar_t *errbuf, int errlen)
     model_free(m);
     return NULL;
   }
-  /* Проход 1: сначала назначаем ключи ВСЕМ блокам, чтобы INSERT мог ссылаться
+  fprintf(stderr, "[MODEL] Blocks: %d\n", nblocks);
+  
+  /* Проход 2: сначала назначаем ключи ВСЕМ блокам, чтобы INSERT мог ссылаться
      на блок, определённый позже (иначе «вперёд»-ссылки не разрешаются и
      содержимое блоков не выводится). */
+  ULONGLONG t_pass2 = perf_mark("PASS2: assign keys");
   int bi = 0;
   for (unsigned int i = 0; i < dwg->num_objects; i++) {
     Dwg_Object *obj = &dwg->object[i];
@@ -1809,8 +1963,11 @@ DwgModel *model_load(const wchar_t *path, wchar_t *errbuf, int errlen)
     m->blocks[bi].key = (const void *)obj;
     bi++;
   }
-  /* Проход 2: строим содержимое блоков (теперь все ключи уже проставлены). */
-  BuildCtx ctx = { m, dwg, 0, 0 };
+  perf_delta("PASS2: assign keys", t_pass2);
+  
+  /* Проход 3: строим содержимое блоков (теперь все ключи уже проставлены). */
+  ULONGLONG t_pass3 = perf_mark("PASS3: build_canvas");
+  BuildCtx ctx = { m, dwg, 0, 0, 0 };
   bi = 0;
   for (unsigned int i = 0; i < dwg->num_objects; i++) {
     Dwg_Object *obj = &dwg->object[i];
@@ -1820,6 +1977,20 @@ DwgModel *model_load(const wchar_t *path, wchar_t *errbuf, int errlen)
     ctx.blk = bi;
     build_canvas(&ctx, obj, 1);
     bi++;
+  }
+  perf_delta("PASS3: build_canvas", t_pass3);
+
+  /* Collect stats */
+  unsigned long total_prims = 0;
+  for (int i = 0; i < m->n_blocks; i++)
+    total_prims += m->blocks[i].prim_emitted;
+  perf_stat("Total primitives emitted", total_prims);
+  {
+    unsigned long total_texts = 0;
+    for (int i = 0; i < m->n_blocks; i++)
+      total_texts += m->blocks[i].n_texts;
+    m->n_texts = total_texts;
+    perf_stat("Total text primitives", total_texts);
   }
 
   /* ---- resolve insets targets (done at emit time; nothing to do here) ---- */
@@ -1851,7 +2022,34 @@ DwgModel *model_load(const wchar_t *path, wchar_t *errbuf, int errlen)
     if (m->xmax - m->xmin < 1e-12)
       m->has_content = 0;
   }
+  
+  /* The parsed LibreDWG graph is only needed while building primitives.
+     Releasing it here saves a large amount of memory, which matters for
+     the model cache and for keeping several listers open. */
+  dwg_free(dwg);
+  memset(dwg, 0, sizeof(*dwg));
+  m->dwg_freed = 1;
+
+  perf_delta("model_load TOTAL", t_start);
   return m;
+}
+
+void model_select_block(DwgModel *m, int bi)
+{
+  if (!m)
+    return;
+  m->render_block = (bi >= 0 && bi < m->n_blocks) ? bi : -1;
+  m->has_content = 0;
+  m->xmin = m->ymin = 1e100;
+  m->xmax = m->ymax = -1e100;
+  if (m->render_block >= 0) {
+    XForm id;
+    xf_identity(&id);
+    block_extents(m, m->render_block, &id, 0);
+    if (m->xmin < m->xmax && m->ymin < m->ymax &&
+        m->xmax - m->xmin > 1e-12)
+      m->has_content = 1;
+  }
 }
 
 void model_free(DwgModel *m)
@@ -1870,6 +2068,164 @@ void model_free(DwgModel *m)
     free(b->inserts);
   }
   free(m->blocks);
-  dwg_free(&m->dwg);
+  if (!m->dwg_freed)
+    dwg_free(&m->dwg);
   free(m);
+}
+
+/* ------------------------------------------------------------------ */
+/* shared model cache                                                  */
+/*                                                                     */
+/* Total Commander asks for a thumbnail (ListGetPreviewBitmapW) and     */
+/* then opens the same file in the lister (ListLoadW), and users often  */
+/* reopen the file they were just looking at. Parsing a large drawing   */
+/* costs seconds, so the most recently loaded model is kept alive and    */
+/* reused when the path, size and modification time all match.          */
+/*                                                                     */
+/* The cache holds exactly one model. References are counted so that a   */
+/* model shared by two windows survives until both close.               */
+
+static CRITICAL_SECTION g_cache_cs;
+static CRITICAL_SECTION g_load_cs;
+static LONG g_cache_init = 0;
+static DwgModel *g_cache_model;
+static wchar_t g_cache_path[MAX_PATH];
+static ULONGLONG g_cache_size;
+static ULONGLONG g_cache_mtime;
+static int g_cache_enabled = 1;
+
+void model_set_cache_enabled(int on)
+{
+  g_cache_enabled = on ? 1 : 0;
+}
+
+static void cache_init_once(void)
+{
+  if (InterlockedCompareExchange(&g_cache_init, 1, 0) == 0) {
+    InitializeCriticalSection(&g_cache_cs);
+    InitializeCriticalSection(&g_load_cs);
+  } else {
+    while (g_cache_init != 2)
+      Sleep(0);
+  }
+  /* mark fully ready (idempotent) */
+  InterlockedCompareExchange(&g_cache_init, 2, 1);
+}
+
+static int file_stamp(const wchar_t *path, ULONGLONG *size,
+                      ULONGLONG *mtime)
+{
+  WIN32_FILE_ATTRIBUTE_DATA fad;
+  if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fad))
+    return 0;
+  *size = ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+  *mtime = ((ULONGLONG)fad.ftLastWriteTime.dwHighDateTime << 32) |
+           fad.ftLastWriteTime.dwLowDateTime;
+  return 1;
+}
+
+/* Return the cached model for this exact file, incrementing its refcount.
+   Caller must hold g_cache_cs. */
+static DwgModel *cache_hit(const wchar_t *path, ULONGLONG size,
+                           ULONGLONG mtime)
+{
+  if (g_cache_model && g_cache_size == size && g_cache_mtime == mtime &&
+      lstrcmpiW(g_cache_path, path) == 0) {
+    g_cache_model->refs++;
+    return g_cache_model;
+  }
+  return NULL;
+}
+
+DwgModel *model_acquire(const wchar_t *path, wchar_t *errbuf, int errlen)
+{
+  return model_acquire_ex(path, errbuf, errlen, NULL, NULL);
+}
+
+DwgModel *model_acquire_ex(const wchar_t *path, wchar_t *errbuf, int errlen,
+                           ModelCancelFn cancelled, void *ctx)
+{
+  if (!g_cache_enabled) {
+    if (cancelled && cancelled(ctx))
+      return NULL;
+    DwgModel *m = model_load(path, errbuf, errlen);
+    if (m)
+      m->refs = 1;
+    return m;
+  }
+
+  ULONGLONG size = 0, mtime = 0;
+  int stamped = file_stamp(path, &size, &mtime);
+
+  cache_init_once();
+
+  EnterCriticalSection(&g_cache_cs);
+  DwgModel *hit = stamped ? cache_hit(path, size, mtime) : NULL;
+  LeaveCriticalSection(&g_cache_cs);
+  if (hit)
+    return hit;
+
+  /* Only one parse at a time; the cache is re-checked once we own the
+     parse lock because another thread may have just loaded the same file. */
+  EnterCriticalSection(&g_load_cs);
+
+  if (cancelled && cancelled(ctx)) {
+    LeaveCriticalSection(&g_load_cs);
+    return NULL;
+  }
+
+  EnterCriticalSection(&g_cache_cs);
+  hit = stamped ? cache_hit(path, size, mtime) : NULL;
+  LeaveCriticalSection(&g_cache_cs);
+  if (hit) {
+    LeaveCriticalSection(&g_load_cs);
+    return hit;
+  }
+
+  DwgModel *m = model_load(path, errbuf, errlen);
+
+  if (m) {
+    DwgModel *old = NULL;
+    int free_old = 0;
+    EnterCriticalSection(&g_cache_cs);
+    if (g_cache_model && g_cache_model != m) {
+      old = g_cache_model;
+      g_cache_model = NULL;
+      if (--old->refs <= 0)
+        free_old = 1;
+    }
+    g_cache_model = m;
+    m->refs = 2; /* one for the cache, one for the caller */
+    lstrcpynW(g_cache_path, path, MAX_PATH);
+    g_cache_size = size;
+    g_cache_mtime = stamped ? mtime : 0;
+    LeaveCriticalSection(&g_cache_cs);
+    if (free_old)
+      model_free(old);
+  }
+
+  LeaveCriticalSection(&g_load_cs);
+  return m;
+}
+
+void model_release(DwgModel *m)
+{
+  if (!m)
+    return;
+  cache_init_once();
+  DwgModel *free_it = NULL;
+  EnterCriticalSection(&g_cache_cs);
+  m->refs--;
+  if (m->refs <= 0) {
+    if (g_cache_model == m) {
+      g_cache_model = NULL;
+      g_cache_path[0] = 0;
+      g_cache_size = 0;
+      g_cache_mtime = 0;
+    }
+    free_it = m;
+  }
+  LeaveCriticalSection(&g_cache_cs);
+  if (free_it)
+    model_free(free_it);
 }
