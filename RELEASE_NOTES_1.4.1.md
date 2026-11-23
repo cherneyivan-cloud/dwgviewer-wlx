@@ -52,10 +52,3 @@
 
 - Windows 7 или новее, **x64**; Total Commander 9.0+ (**64-бит**).
 - DWG R13/R14/R2000/R2004/R2007/R2010/R2013/R2018.
-
-## Контрольные суммы
-
-```
-SHA-256 DwgViewer-win64.zip
-43DE28DE2E312650763C237A26C94221B273DB4344BB81ECF99EA52BF74EE351
-```
