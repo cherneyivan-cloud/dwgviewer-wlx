@@ -85,6 +85,7 @@ typedef struct {
   volatile LONG closing;   /* window is going away; do not post messages */
   volatile LONG refs;      /* window owner + loader thread */
   DWORD load_start;
+  int load_source;         /* 0 parsed, 1 memory cache, 2 disk cache */
   wchar_t load_err[512];
 } ViewCtx;
 
@@ -724,6 +725,8 @@ static ViewCtx *create_view(const WCHAR *file, HWND parent, int showflags,
   v->flipY = GetPrivateProfileIntW(L"Options", L"FlipY", 0, ini) == 1;
   model_set_cache_enabled(
       GetPrivateProfileIntW(L"Options", L"CacheModel", 1, ini) != 0);
+  model_set_disk_cache_enabled(
+      GetPrivateProfileIntW(L"Options", L"DiskCache", 1, ini) != 0);
   draw_set_text_min_px(
       (double)GetPrivateProfileIntW(L"Options", L"TextMinPx", 4, ini));
   {
@@ -781,7 +784,8 @@ static ViewCtx *create_view(const WCHAR *file, HWND parent, int showflags,
   /* Thread creation failed: fall back to loading on this thread. */
   InterlockedDecrement(&v->refs);
   InterlockedExchange(&v->loading, 0);
-  v->model = model_acquire(file, v->load_err, 512);
+  v->model = model_acquire_ex(file, v->load_err, 512, NULL, NULL,
+                              &v->load_source);
   log_open_result(v, return_log, rl_len);
   return v;
 }
@@ -791,9 +795,13 @@ static void log_open_result(ViewCtx *v, wchar_t *return_log, int rl_len)
   wchar_t line[620];
   DWORD el = v->load_start ? (GetTickCount() - v->load_start) : 0;
   if (v->model) {
-    _snwprintf(line, 620, L"OPEN %ls -> OK (v=%hs, objects=%u, texts=%lu, %lu ms)",
+    const wchar_t *src = v->load_source == 1 ? L"mem"
+                         : v->load_source == 2 ? L"disk"
+                                               : L"dwg";
+    _snwprintf(line, 620,
+               L"OPEN %ls -> OK (v=%hs, objects=%u, texts=%lu, %ls, %lu ms)",
                v->file, v->model->version, v->model->obj_count,
-               v->model->n_texts, (unsigned long)el);
+               v->model->n_texts, src, (unsigned long)el);
   } else {
     _snwprintf(line, 620, L"OPEN %ls -> FAIL: %ls", v->file,
                v->load_err[0] ? v->load_err : L"неизвестная ошибка");
@@ -819,7 +827,8 @@ static DWORD WINAPI load_thread(LPVOID param)
   }
 
   DwgModel *m =
-      model_acquire_ex(v->file, v->load_err, 512, load_cancelled, v);
+      model_acquire_ex(v->file, v->load_err, 512, load_cancelled, v,
+                       &v->load_source);
 
   if (InterlockedCompareExchange(&v->closing, 0, 0)) {
     if (m)
@@ -839,6 +848,10 @@ static DWORD WINAPI load_thread(LPVOID param)
     if (h)
       PostMessageW(h, WM_APP_DWG_LOADED, 0, 0);
   }
+  /* Persist a freshly parsed model for the next run. Done after the model
+     has been handed to the window, so it never delays the first paint. */
+  if (m && v->load_source == 0)
+    model_cache_save(m, v->file);
   view_release(v);
   return 0;
 }

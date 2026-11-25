@@ -86,10 +86,18 @@ void model_release(DwgModel *m);
 
 /* Same as model_acquire, but gives up (returns NULL) if cancelled(ctx)
    returns non-zero before the parse actually starts. Used by the lister so
-   that a closed window does not spend seconds parsing in the background. */
+   that a closed window does not spend seconds parsing in the background.
+   *source (optional) receives 0 = parsed, 1 = memory cache, 2 = disk cache. */
 typedef int (*ModelCancelFn)(void *ctx);
 DwgModel *model_acquire_ex(const wchar_t *path, wchar_t *errbuf, int errlen,
-                           ModelCancelFn cancelled, void *ctx);
+                           ModelCancelFn cancelled, void *ctx, int *source);
+
+/* Write the parsed model to the on-disk cache (background use). Returns 1
+   when the entry was written. Safe to call while the model is being drawn. */
+int model_cache_save(DwgModel *m, const wchar_t *path);
+
+/* Enable/disable the on-disk cache (default: enabled). */
+void model_set_disk_cache_enabled(int on);
 
 /* Enable/disable the shared-model cache (default: enabled). Disabling it
    keeps memory low on machines that only view each file once. */

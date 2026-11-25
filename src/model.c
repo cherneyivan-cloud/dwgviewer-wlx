@@ -2137,20 +2137,500 @@ static DwgModel *cache_hit(const wchar_t *path, ULONGLONG size,
   return NULL;
 }
 
+/* ------------------------------------------------------------------ */
+/* disk cache                                                          */
+/*                                                                     */
+/* Decoding a large DWG costs seconds inside LibreDWG, while writing    */
+/* the already-built primitive model to disk and reading it back is     */
+/* far cheaper. The cache is keyed by path + size + mtime and lives in  */
+/* %LOCALAPPDATA%\DwgViewer\cache; old entries are evicted when the     */
+/* directory grows beyond DISK_CACHE_MAX_TOTAL.                         */
+
+#define DISK_CACHE_VERSION 1
+#define DISK_CACHE_MAX_TOTAL (2ULL * 1024ULL * 1024ULL * 1024ULL)
+#define DISK_CACHE_MAX_FILE (512ULL * 1024ULL * 1024ULL)
+/* files smaller than this parse quickly enough that caching only wastes
+   disk space */
+#define DISK_CACHE_MIN_OBJECTS 30000u
+
+#define DC_MAX_BLOCKS 1000000u
+#define DC_MAX_PRIMS 50000000u
+#define DC_MAX_INSERTS 10000000u
+#define DC_MAX_PTS 10000000u
+#define DC_MAX_TEXT 1000000u
+
+static int g_disk_cache_enabled = 1;
+static CRITICAL_SECTION g_disk_cs;
+static LONG g_disk_cs_state = 0;
+
+void model_set_disk_cache_enabled(int on)
+{
+  g_disk_cache_enabled = on ? 1 : 0;
+}
+
+static void disk_lock(void)
+{
+  if (InterlockedCompareExchange(&g_disk_cs_state, 1, 0) == 0) {
+    InitializeCriticalSection(&g_disk_cs);
+    InterlockedExchange(&g_disk_cs_state, 2);
+  } else {
+    while (g_disk_cs_state != 2)
+      Sleep(0);
+  }
+  EnterCriticalSection(&g_disk_cs);
+}
+
+static void disk_unlock(void) { LeaveCriticalSection(&g_disk_cs); }
+
+static int cache_dir(wchar_t *out, int cch)
+{
+  wchar_t base[MAX_PATH];
+  DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH)
+    return 0;
+  wchar_t dir[MAX_PATH];
+  _snwprintf(dir, MAX_PATH, L"%ls\\DwgViewer", base);
+  CreateDirectoryW(dir, NULL);
+  _snwprintf(out, cch, L"%ls\\cache", dir);
+  CreateDirectoryW(out, NULL);
+  return 1;
+}
+
+/* FNV-1a over the lower-cased path -> stable file name */
+static void cache_name(const wchar_t *path, wchar_t *out, int cch)
+{
+  unsigned long long h = 1469598103934665603ULL;
+  for (const wchar_t *s = path; *s; s++) {
+    wchar_t c = *s;
+    if (c >= L'A' && c <= L'Z')
+      c = (wchar_t)(c + 32);
+    h ^= (unsigned long long)(unsigned short)c;
+    h *= 1099511628211ULL;
+  }
+  _snwprintf(out, cch, L"%016llx.dwgc", h);
+}
+
+static int wu8(FILE *f, unsigned int v) { return fputc((int)(v & 0xFF), f) != EOF; }
+static int wu32(FILE *f, unsigned int v) { return fwrite(&v, sizeof(v), 1, f) == 1; }
+static int wi32(FILE *f, int v) { return fwrite(&v, sizeof(v), 1, f) == 1; }
+static int wu64(FILE *f, unsigned long long v) { return fwrite(&v, sizeof(v), 1, f) == 1; }
+static int wd(FILE *f, double v) { return fwrite(&v, sizeof(v), 1, f) == 1; }
+
+static int ru8(FILE *f, unsigned int *v)
+{
+  int c = fgetc(f);
+  if (c == EOF)
+    return 0;
+  *v = (unsigned int)c;
+  return 1;
+}
+static int ru32(FILE *f, unsigned int *v) { return fread(v, sizeof(*v), 1, f) == 1; }
+static int ri32(FILE *f, int *v) { return fread(v, sizeof(*v), 1, f) == 1; }
+static int ru64(FILE *f, unsigned long long *v) { return fread(v, sizeof(*v), 1, f) == 1; }
+static int rdouble(FILE *f, double *v) { return fread(v, sizeof(*v), 1, f) == 1; }
+
+static int cache_write_model(FILE *f, DwgModel *m)
+{
+  char ver[32];
+  memset(ver, 0, sizeof(ver));
+  memcpy(ver, m->version, 31);
+  if (fwrite(ver, 1, 32, f) != 32)
+    return 0;
+  if (!wu32(f, (unsigned)m->obj_count) || !wu32(f, (unsigned)m->n_texts))
+    return 0;
+  if (!wi32(f, m->render_block))
+    return 0;
+  if (!wu8(f, (unsigned)(m->has_content ? 1 : 0)))
+    return 0;
+  if (!wd(f, m->xmin) || !wd(f, m->ymin) || !wd(f, m->xmax) || !wd(f, m->ymax))
+    return 0;
+  if (!wu32(f, (unsigned)m->n_blocks))
+    return 0;
+  for (int i = 0; i < m->n_blocks; i++) {
+    MBlock *b = &m->blocks[i];
+    if (!wi32(f, b->id) || !wu32(f, (unsigned)b->n_prims) ||
+        !wu32(f, (unsigned)b->n_inserts))
+      return 0;
+    for (int j = 0; j < b->n_prims; j++) {
+      KPrim *p = &b->prims[j];
+      int fill = p->fill < 0 ? 0 : (p->fill > 255 ? 255 : p->fill);
+      int pen = p->pen < 0 ? 0 : (p->pen > 255 ? 255 : p->pen);
+      if (!wu8(f, (unsigned)p->kind) || !wu8(f, (unsigned)fill) ||
+          !wu8(f, (unsigned)pen) || !wu32(f, (unsigned)p->color))
+        return 0;
+      if (p->kind == KP_TEXT) {
+        if (!wu32(f, 0))
+          return 0;
+        if (!wd(f, p->pos.x) || !wd(f, p->pos.y) || !wd(f, p->height) ||
+            !wd(f, p->rot) || !wd(f, p->wrap_width))
+          return 0;
+        if (!wi32(f, p->attach))
+          return 0;
+        if (!wd(f, p->linespace) || !wd(f, p->wf))
+          return 0;
+        unsigned int tl = p->text ? (unsigned int)wcslen(p->text) : 0;
+        if (!wu32(f, tl))
+          return 0;
+        if (tl && fwrite(p->text, sizeof(wchar_t), tl, f) != tl)
+          return 0;
+      } else {
+        if (!wu32(f, (unsigned)p->n))
+          return 0;
+        if (p->n > 0 && p->p &&
+            fwrite(p->p, sizeof(MPt), (size_t)p->n, f) != (size_t)p->n)
+          return 0;
+      }
+    }
+    for (int j = 0; j < b->n_inserts; j++) {
+      MInsert *r = &b->inserts[j];
+      if (!wd(f, r->pos.x) || !wd(f, r->pos.y) || !wd(f, r->scale[0]) ||
+          !wd(f, r->scale[1]) || !wd(f, r->rot))
+        return 0;
+      if (!wi32(f, r->target))
+        return 0;
+    }
+  }
+  return 1;
+}
+
+/* Returns 1 on success. On failure the partially built model is freed by
+   the caller through model_free(). */
+static int cache_read_model(FILE *f, DwgModel *m)
+{
+  char ver[32];
+  unsigned int obj_count = 0, n_texts = 0, n_blocks = 0, has = 0;
+  int render_block = -1;
+  if (fread(ver, 1, 32, f) != 32)
+    return 0;
+  ver[31] = 0;
+  if (!ru32(f, &obj_count) || !ru32(f, &n_texts) || !ri32(f, &render_block) ||
+      !ru8(f, &has))
+    return 0;
+  if (!rdouble(f, &m->xmin) || !rdouble(f, &m->ymin) ||
+      !rdouble(f, &m->xmax) || !rdouble(f, &m->ymax))
+    return 0;
+  if (!ru32(f, &n_blocks) || n_blocks > DC_MAX_BLOCKS)
+    return 0;
+
+  memcpy(m->version, ver, sizeof(m->version));
+  m->obj_count = obj_count;
+  m->n_texts = n_texts;
+  m->render_block = render_block;
+  m->has_content = has ? 1 : 0;
+  m->dwg_freed = 1; /* no LibreDWG data in a cached model */
+
+  m->blocks = (MBlock *)calloc(n_blocks ? n_blocks : 1, sizeof(MBlock));
+  if (!m->blocks)
+    return 0;
+
+  for (unsigned int i = 0; i < n_blocks; i++) {
+    MBlock *b = &m->blocks[i];
+    unsigned int np = 0, ni = 0;
+    if (!ri32(f, &b->id) || !ru32(f, &np) || !ru32(f, &ni))
+      return 0;
+    if (np > DC_MAX_PRIMS || ni > DC_MAX_INSERTS)
+      return 0;
+    b->key = NULL;
+    if (np) {
+      b->prims = (KPrim *)calloc(np, sizeof(KPrim));
+      if (!b->prims)
+        return 0;
+      b->cap_prims = (int)np;
+    }
+    if (ni) {
+      b->inserts = (MInsert *)calloc(ni, sizeof(MInsert));
+      if (!b->inserts)
+        return 0;
+      b->cap_inserts = (int)ni;
+    }
+    m->n_blocks = (int)i + 1; /* lets model_free() clean up on error */
+
+    for (unsigned int j = 0; j < np; j++) {
+      KPrim *p = &b->prims[j];
+      unsigned int kind = 0, fill = 0, pen = 0, color = 0;
+      if (!ru8(f, &kind) || !ru8(f, &fill) || !ru8(f, &pen) ||
+          !ru32(f, &color))
+        return 0;
+      if (kind > KP_POINT)
+        return 0;
+      p->kind = (KPrimKind)kind;
+      p->fill = (int)fill;
+      p->pen = (int)pen;
+      p->color = (COLORREF)color;
+      b->n_prims = (int)j + 1;
+      if (p->kind == KP_TEXT) {
+        unsigned int n = 0, tl = 0;
+        if (!ru32(f, &n))
+          return 0;
+        if (!rdouble(f, &p->pos.x) || !rdouble(f, &p->pos.y) ||
+            !rdouble(f, &p->height) || !rdouble(f, &p->rot) ||
+            !rdouble(f, &p->wrap_width))
+          return 0;
+        if (!ri32(f, &p->attach))
+          return 0;
+        if (!rdouble(f, &p->linespace) || !rdouble(f, &p->wf))
+          return 0;
+        if (!ru32(f, &tl) || tl > DC_MAX_TEXT)
+          return 0;
+        if (tl) {
+          p->text = (wchar_t *)malloc(((size_t)tl + 1) * sizeof(wchar_t));
+          if (!p->text)
+            return 0;
+          if (fread(p->text, sizeof(wchar_t), tl, f) != tl)
+            return 0;
+          p->text[tl] = 0;
+        }
+        b->n_texts++;
+      } else {
+        unsigned int n = 0;
+        if (!ru32(f, &n) || n > DC_MAX_PTS)
+          return 0;
+        p->n = (int)n;
+        if (n) {
+          p->p = (MPt *)malloc((size_t)n * sizeof(MPt));
+          if (!p->p)
+            return 0;
+          if (fread(p->p, sizeof(MPt), n, f) != n)
+            return 0;
+        }
+      }
+      b->prim_emitted++;
+    }
+    for (unsigned int j = 0; j < ni; j++) {
+      MInsert *r = &b->inserts[j];
+      if (!rdouble(f, &r->pos.x) || !rdouble(f, &r->pos.y) ||
+          !rdouble(f, &r->scale[0]) || !rdouble(f, &r->scale[1]) ||
+          !rdouble(f, &r->rot))
+        return 0;
+      if (!ri32(f, &r->target))
+        return 0;
+      b->n_inserts = (int)j + 1;
+    }
+  }
+  return 1;
+}
+
+static int cache_remove_stale(const wchar_t *dir);
+
+static DwgModel *cache_load(const wchar_t *path, ULONGLONG size,
+                            ULONGLONG mtime)
+{
+  wchar_t dir[MAX_PATH], name[64], full[MAX_PATH];
+  if (!cache_dir(dir, MAX_PATH))
+    return NULL;
+  cache_name(path, name, 64);
+  _snwprintf(full, MAX_PATH, L"%ls\\%ls", dir, name);
+
+  disk_lock();
+  FILE *f = _wfopen(full, L"rb");
+  if (!f) {
+    disk_unlock();
+    return NULL;
+  }
+
+  int ok = 1;
+  char magic[9];
+  unsigned int ver = 0, plen = 0;
+  unsigned long long fsz = 0, fmt = 0;
+  if (fread(magic, 1, 9, f) != 9 || memcmp(magic, "DWGVCACHE", 9) != 0)
+    ok = 0;
+  if (ok && (!ru32(f, &ver) || ver != DISK_CACHE_VERSION))
+    ok = 0;
+  if (ok && (!ru64(f, &fsz) || fsz != size))
+    ok = 0;
+  if (ok && (!ru64(f, &fmt) || fmt != mtime))
+    ok = 0;
+  wchar_t spath[MAX_PATH];
+  if (ok && (!ru32(f, &plen) || plen == 0 || plen >= MAX_PATH))
+    ok = 0;
+  if (ok) {
+    if (fread(spath, sizeof(wchar_t), plen, f) != plen)
+      ok = 0;
+    else {
+      spath[plen] = 0;
+      if (lstrcmpiW(spath, path) != 0)
+        ok = 0;
+    }
+  }
+
+  DwgModel *m = NULL;
+  if (ok) {
+    m = (DwgModel *)calloc(1, sizeof(DwgModel));
+    if (!m)
+      ok = 0;
+  }
+  if (ok && !cache_read_model(f, m)) {
+    m->dwg_freed = 1;
+    model_free(m);
+    m = NULL;
+    ok = 0;
+  }
+  fclose(f);
+  disk_unlock();
+
+  if (!m) {
+    /* stale, truncated or incompatible: drop it and parse normally */
+    _wremove(full);
+    cache_remove_stale(dir);
+  }
+  return m;
+}
+
+/* Delete the oldest entries until the cache directory fits the budget. */
+static int cache_remove_stale(const wchar_t *dir)
+{
+  wchar_t mask[MAX_PATH];
+  _snwprintf(mask, MAX_PATH, L"%ls\\*.dwgc", dir);
+  WIN32_FIND_DATAW fd;
+  HANDLE h = FindFirstFileW(mask, &fd);
+  if (h == INVALID_HANDLE_VALUE)
+    return 0;
+
+  typedef struct {
+    wchar_t name[MAX_PATH];
+    unsigned long long t;
+    unsigned long long sz;
+  } Ent;
+  int cap = 128, n = 0;
+  Ent *list = (Ent *)malloc((size_t)cap * sizeof(Ent));
+  unsigned long long total = 0;
+  if (!list) {
+    FindClose(h);
+    return 0;
+  }
+  do {
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+      continue;
+    unsigned long long sz =
+        ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+    total += sz;
+    if (n == cap) {
+      cap *= 2;
+      Ent *nl = (Ent *)realloc(list, (size_t)cap * sizeof(Ent));
+      if (!nl)
+        break;
+      list = nl;
+    }
+    lstrcpynW(list[n].name, fd.cFileName, MAX_PATH);
+    list[n].t = ((unsigned long long)fd.ftLastWriteTime.dwHighDateTime << 32) |
+                fd.ftLastWriteTime.dwLowDateTime;
+    list[n].sz = sz;
+    n++;
+  } while (FindNextFileW(h, &fd));
+  FindClose(h);
+
+  int removed = 0;
+  if (total > DISK_CACHE_MAX_TOTAL) {
+    /* oldest first */
+    for (int i = 0; i < n; i++)
+      for (int j = i + 1; j < n; j++)
+        if (list[j].t < list[i].t) {
+          Ent t = list[i];
+          list[i] = list[j];
+          list[j] = t;
+        }
+    unsigned long long target = DISK_CACHE_MAX_TOTAL / 2;
+    for (int i = 0; i < n && total > target; i++) {
+      wchar_t full[MAX_PATH];
+      _snwprintf(full, MAX_PATH, L"%ls\\%ls", dir, list[i].name);
+      if (_wremove(full) == 0) {
+        total -= list[i].sz;
+        removed++;
+      }
+    }
+  }
+  free(list);
+  return removed;
+}
+
+int model_cache_save(DwgModel *m, const wchar_t *path)
+{
+  if (!m || !g_disk_cache_enabled)
+    return 0;
+  if (!m->has_content || m->obj_count < DISK_CACHE_MIN_OBJECTS)
+    return 0;
+
+  ULONGLONG size = 0, mtime = 0;
+  if (!file_stamp(path, &size, &mtime))
+    return 0;
+  wchar_t dir[MAX_PATH], name[64], full[MAX_PATH], tmp[MAX_PATH + 8];
+  if (!cache_dir(dir, MAX_PATH))
+    return 0;
+  cache_name(path, name, 64);
+  _snwprintf(full, MAX_PATH, L"%ls\\%ls", dir, name);
+  _snwprintf(tmp, MAX_PATH + 8, L"%ls.tmp", full);
+
+  static char iobuf[256 * 1024];
+  unsigned int plen = (unsigned int)wcslen(path);
+  if (plen == 0 || plen >= MAX_PATH)
+    return 0;
+
+  disk_lock();
+  FILE *f = _wfopen(tmp, L"wb");
+  if (!f) {
+    disk_unlock();
+    return 0;
+  }
+  setvbuf(f, iobuf, _IOFBF, sizeof(iobuf));
+  int ok = fwrite("DWGVCACHE", 1, 9, f) == 9 && wu32(f, DISK_CACHE_VERSION) &&
+           wu64(f, size) && wu64(f, mtime) && wu32(f, plen) &&
+           fwrite(path, sizeof(wchar_t), plen, f) == plen &&
+           cache_write_model(f, m);
+  long long bytes = _ftelli64(f);
+  fclose(f);
+
+  if (!ok || bytes <= 0 || (unsigned long long)bytes > DISK_CACHE_MAX_FILE) {
+    _wremove(tmp);
+    disk_unlock();
+    return 0;
+  }
+  MoveFileExW(tmp, full, MOVEFILE_REPLACE_EXISTING);
+  cache_remove_stale(dir);
+  disk_unlock();
+  return 1;
+}
+
 DwgModel *model_acquire(const wchar_t *path, wchar_t *errbuf, int errlen)
 {
-  return model_acquire_ex(path, errbuf, errlen, NULL, NULL);
+  return model_acquire_ex(path, errbuf, errlen, NULL, NULL, NULL);
+}
+
+/* Make m the single in-memory cached model. Returns the previous cached
+   model when nobody else references it (the caller must free it). */
+static DwgModel *cache_install(DwgModel *m, const wchar_t *path,
+                               ULONGLONG size, ULONGLONG mtime)
+{
+  DwgModel *free_old = NULL;
+  EnterCriticalSection(&g_cache_cs);
+  if (g_cache_model && g_cache_model != m) {
+    DwgModel *old = g_cache_model;
+    g_cache_model = NULL;
+    if (--old->refs <= 0)
+      free_old = old;
+  }
+  g_cache_model = m;
+  m->refs = 2; /* one for the cache, one for the caller */
+  lstrcpynW(g_cache_path, path, MAX_PATH);
+  g_cache_size = size;
+  g_cache_mtime = mtime;
+  LeaveCriticalSection(&g_cache_cs);
+  return free_old;
 }
 
 DwgModel *model_acquire_ex(const wchar_t *path, wchar_t *errbuf, int errlen,
-                           ModelCancelFn cancelled, void *ctx)
+                           ModelCancelFn cancelled, void *ctx, int *source)
 {
+  if (source)
+    *source = -1;
   if (!g_cache_enabled) {
     if (cancelled && cancelled(ctx))
       return NULL;
     DwgModel *m = model_load(path, errbuf, errlen);
-    if (m)
+    if (m) {
       m->refs = 1;
+      if (source)
+        *source = 0;
+    }
     return m;
   }
 
@@ -2162,8 +2642,11 @@ DwgModel *model_acquire_ex(const wchar_t *path, wchar_t *errbuf, int errlen,
   EnterCriticalSection(&g_cache_cs);
   DwgModel *hit = stamped ? cache_hit(path, size, mtime) : NULL;
   LeaveCriticalSection(&g_cache_cs);
-  if (hit)
+  if (hit) {
+    if (source)
+      *source = 1;
     return hit;
+  }
 
   /* Only one parse at a time; the cache is re-checked once we own the
      parse lock because another thread may have just loaded the same file. */
@@ -2179,33 +2662,39 @@ DwgModel *model_acquire_ex(const wchar_t *path, wchar_t *errbuf, int errlen,
   LeaveCriticalSection(&g_cache_cs);
   if (hit) {
     LeaveCriticalSection(&g_load_cs);
+    if (source)
+      *source = 1;
     return hit;
+  }
+
+  /* Nothing in memory: try the on-disk cache before paying for a parse. */
+  if (g_disk_cache_enabled && stamped) {
+    DwgModel *dm = cache_load(path, size, mtime);
+    if (dm) {
+      DwgModel *old = cache_install(dm, path, size, mtime);
+      LeaveCriticalSection(&g_load_cs);
+      if (old)
+        model_free(old);
+      if (source)
+        *source = 2;
+      return dm;
+    }
   }
 
   DwgModel *m = model_load(path, errbuf, errlen);
 
   if (m) {
-    DwgModel *old = NULL;
-    int free_old = 0;
-    EnterCriticalSection(&g_cache_cs);
-    if (g_cache_model && g_cache_model != m) {
-      old = g_cache_model;
-      g_cache_model = NULL;
-      if (--old->refs <= 0)
-        free_old = 1;
-    }
-    g_cache_model = m;
-    m->refs = 2; /* one for the cache, one for the caller */
-    lstrcpynW(g_cache_path, path, MAX_PATH);
-    g_cache_size = size;
-    g_cache_mtime = stamped ? mtime : 0;
-    LeaveCriticalSection(&g_cache_cs);
-    if (free_old)
+    DwgModel *old = cache_install(m, path, size, stamped ? mtime : 0);
+    LeaveCriticalSection(&g_load_cs);
+    if (old)
       model_free(old);
+    if (source)
+      *source = 0;
+    return m;
   }
 
   LeaveCriticalSection(&g_load_cs);
-  return m;
+  return NULL;
 }
 
 void model_release(DwgModel *m)
